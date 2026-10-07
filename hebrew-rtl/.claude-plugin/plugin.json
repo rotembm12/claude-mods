@@ -1,0 +1,9 @@
+{
+  "name": "hebrew-rtl",
+  "version": "0.1.0",
+  "description": "Draws Hebrew text in the terminal right to left, so replies read correctly in terminals with no bidi support",
+  "author": {
+    "name": "Rotem"
+  },
+  "types": "./types/index.d.ts"
+}

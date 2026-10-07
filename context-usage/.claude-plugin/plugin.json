@@ -1,0 +1,9 @@
+{
+  "name": "context-usage",
+  "version": "0.1.0",
+  "description": "Shows how full the session's context window is, in a band above the prompt",
+  "author": {
+    "name": "Rotem"
+  },
+  "types": "./types/index.d.ts"
+}

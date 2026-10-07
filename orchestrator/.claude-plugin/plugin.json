@@ -1,0 +1,7 @@
+{
+  "name": "orchestrator",
+  "version": "0.1.0",
+  "description": "Turns a session into an orchestrator that delegates work to subagents, picks a model for each, and keeps its own context small (/orchestrator on|off|status)",
+  "author": { "name": "Rotem" },
+  "types": "./types/index.d.ts"
+}
