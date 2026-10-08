@@ -319,6 +319,24 @@ test('the band shows the switch off, and a press switches the mode', async ($, o
   expect((seen.store.sessions as Record<string, { isOn: boolean }>)['session-a']?.isOn).toBe(false)
 })
 
+test('the desktop draws the switch as native buttons, the one that holds primary, with no fixed colors', async ($, on) => {
+  engine(on)
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'desktop', ...band() })
+  expect((await ui.find({ key: 'orchestrator-off' }))?.props).toMatchObject({ label: 'off', variant: 'primary' })
+  expect((await ui.find({ key: 'orchestrator-on' }))?.props).toMatchObject({ label: 'on', variant: 'secondary' })
+  expect((await ui.find({ key: 'orchestrator-on' }))?.props.plain).toBeUndefined()
+
+  await ui.press({ key: 'orchestrator-on' })
+  expect((await ui.find({ key: 'orchestrator-off' }))?.props.variant).toBe('secondary')
+  expect((await ui.find({ key: 'orchestrator-on' }))?.props.variant).toBe('primary')
+  await ui.unmount()
+
+  // The terminal keeps its filled segments.
+  const terminal = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...band() })
+  expect((await terminal.find({ key: 'orchestrator-on' }))?.props).toMatchObject({ label: ' on ', plain: true })
+  await terminal.unmount()
+})
+
 test('the band follows /orchestrator, steps aside for a survey, and fits a narrow width', async ($, on) => {
   engine(on)
   await run($, 'on')

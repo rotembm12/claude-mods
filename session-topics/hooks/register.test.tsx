@@ -131,6 +131,19 @@ test('a narrow band cuts the topics to fit', async ($, on) => {
   }
 })
 
+test('a system reminder in front of the prompt is no part of the topic', async ($, on) => {
+  const { asked, clock } = engine(on, { replies: ['["Login bug"]'] })
+  await type($, '<system-reminder>\nThe user started this session in the desktop app.\n</system-reminder>\nfix the login bug in auth.ts')
+
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'desktop', ...band() })
+  expect(await ui.find({ type: 'Text', text: 'fix the login bug in auth.ts' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /system-reminder/ })).toBeUndefined()
+  await ui.unmount()
+
+  await clock.settle()
+  expect(asked[0]).not.toContain('system-reminder')
+})
+
 test('a slash command counts by its arguments alone', async ($, on) => {
   const { asked, clock } = engine(on, { replies: ['["Topics band"]'] })
   await type($, '/goal build a band that shows the session topics')

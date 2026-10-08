@@ -41,8 +41,9 @@ function clip(text: string, width: number): string {
 }
 
 // A slash command counts by its arguments alone: `/goal build X` is about X.
+// The desktop puts a system reminder in front of the first prompt; it is no topic.
 function subjectOf(text: string): string {
-  const trimmed = text.trim()
+  const trimmed = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
   return trimmed.startsWith('/') ? trimmed.replace(/^\/\S*\s*/, '').trim() : trimmed
 }
 

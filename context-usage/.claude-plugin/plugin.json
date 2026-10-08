@@ -1,6 +1,6 @@
 {
   "name": "context-usage",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Shows how full the session's context window is, in a band above the prompt",
   "author": {
     "name": "Rotem"

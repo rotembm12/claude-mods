@@ -205,7 +205,11 @@ export const register: Register = on => {
     const toggle = `${isOpen ? '▾' : '▸'} details`
     const room = e.props.bodyColumns - SWITCH_CELLS - (runs.length > 0 ? toggle.length + 2 : 0) - 2
 
-    const offSegment = isOnNow ? (
+    // The terminal draws the two segments as one filled control. Every other
+    // surface draws native buttons, so the segment that holds is the primary one.
+    const offSegment = e.surface !== 'terminal' ? (
+      <Button key={OFF_KEY} variant={isOnNow ? 'secondary' : 'primary'} label="off" onPress={() => setByPress($, false)} />
+    ) : isOnNow ? (
       <Box backgroundColor={TRACK}>
         <Button key={OFF_KEY} plain dimColor label=" off " onPress={() => setByPress($, false)} />
       </Box>
@@ -214,7 +218,9 @@ export const register: Register = on => {
         <Button key={OFF_KEY} plain label=" off " onPress={() => setByPress($, false)} />
       </Box>
     )
-    const onSegment = isOnNow ? (
+    const onSegment = e.surface !== 'terminal' ? (
+      <Button key={ON_KEY} variant={isOnNow ? 'primary' : 'secondary'} label="on" onPress={() => setByPress($, true)} />
+    ) : isOnNow ? (
       <Box backgroundColor="success">
         <Button key={ON_KEY} plain label=" on " onPress={() => setByPress($, true)} />
       </Box>

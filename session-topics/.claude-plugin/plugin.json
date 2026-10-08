@@ -1,6 +1,6 @@
 {
   "name": "session-topics",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Shows the session's topics and a per-session color above the prompt, so side-by-side sessions are easy to tell apart",
   "author": { "name": "Rotem" },
   "types": "./types/index.d.ts"
