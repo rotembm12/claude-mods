@@ -3,7 +3,7 @@
   "owner": {
     "name": "Rotem"
   },
-  "description": "Claude Code mods by Rotem: context usage, session topics, Hebrew RTL, and an orchestrator mode",
+  "description": "Claude Code mods by Rotem: context usage, session topics, and an orchestrator mode",
   "plugins": [
     {
       "name": "context-usage",
@@ -14,11 +14,6 @@
       "name": "session-topics",
       "source": "./session-topics",
       "description": "Shows the session's topics and a per-session color above the prompt, so side-by-side sessions are easy to tell apart"
-    },
-    {
-      "name": "hebrew-rtl",
-      "source": "./hebrew-rtl",
-      "description": "Draws Hebrew text in the terminal right to left, so replies read correctly in terminals with no bidi support"
     },
     {
       "name": "orchestrator",
