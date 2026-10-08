@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { AgentRun, Saved } from '../types'
-import { ORCHESTRATOR_PROMPT, REPORT_CONTRACT, ROLES } from './prompts'
+import { CONTEXT_BUDGET, ORCHESTRATOR_PROMPT, REPORT_CONTRACT, ROLES } from './prompts'
 
 const IS_ON = { plugin: 'orchestrator', key: 'isOn' } as const
 const isOn = atom(IS_ON, false)
@@ -320,10 +320,10 @@ export const register: Register = on => {
     if (e.model === undefined ? !isRole : !isAllowed(e.model)) return { deny: SPAWN_DENY }
     if (e.parentAgentId !== undefined) return next(e)
 
-    // The roles carry the contract in their own prompts, and a workflow agent's
-    // prompt cannot be rewritten.
+    // The roles carry the budget and the contract in their own prompts, and a
+    // workflow agent's prompt cannot be rewritten.
     const addsContract = !isRole && e.workflow === undefined && e.isTeammate === undefined
-    const result = await next(addsContract ? { ...e, prompt: `${e.prompt}\n\n${REPORT_CONTRACT}` } : e)
+    const result = await next(addsContract ? { ...e, prompt: `${e.prompt}\n\n${CONTEXT_BUDGET}\n\n${REPORT_CONTRACT}` } : e)
     if ('deny' in result && result.deny !== undefined) return result
 
     const now = await $.clock.now()

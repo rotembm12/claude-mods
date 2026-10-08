@@ -194,6 +194,7 @@ test('while on, built-in agents get the report contract, roles do not, and the b
   await spawn($, 'orchestrator:scout')
 
   expect(seen.spawned[1]?.prompt).toContain('STATUS: done | partial | blocked | failed')
+  expect(seen.spawned[1]?.prompt).toContain('context budget for this task is about 150K tokens')
   expect(seen.spawned[2]?.prompt).toBe('Goal: find the retry logic')
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ plugin: PLUGIN, surface, ...band() })

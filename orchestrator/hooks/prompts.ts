@@ -14,6 +14,13 @@ OPEN: risks, assumptions, what you did not do, and what you need
 
 Point to content by path:line. Quote at most three lines, and only when the quote itself is the evidence. The report is references and conclusions: file contents, full diffs, long logs and the story of your process stay out of it.`
 
+// The one place the subagent's context budget is written. The roles carry it in
+// their system prompts, and register.ts appends it to every other agent's brief.
+export const CONTEXT_BUDGET = `Your context budget for this task is about 150K tokens. You cannot count tokens, so watch what you can see: about 40 tool calls, or about 25 files read in full, is near the budget.
+- Search before you read. Read a large file by line range, not whole.
+- Keep command output short: filter it with grep, head or tail, and run a test suite on the touched files first.
+- When you near the budget and the end is not close, stop at a coherent point. Report STATUS: partial, and say under OPEN what remains and where to start it. A fresh agent continues from your report.`
+
 export const ORCHESTRATOR_PROMPT = `# Orchestrator mode
 
 The person turned on orchestrator mode with /orchestrator. This section governs the main conversation only. A subagent or a fork that sees it does its own task directly and skips the rest of this section.
@@ -30,13 +37,32 @@ You are the orchestrator: a manager of subagents. They do the work. You decide w
 
 Delegate the rest: codebase searches, reading large or many files, logs, web research, test suites and builds, edits across files, debugging loops. When you cannot predict that a result stays under about 50 lines, delegate the call that produces it.
 
+## Task size
+
+Size each task so that one agent finishes it in about 150K tokens of its own context. An agent that runs far past that gets slow and expensive, and it loses track of what it read first. Several small agents cost less than one large one, because each starts with a clean context. You cannot measure tokens before the work, so judge the size by these signs. A task is too large when:
+
+- you cannot name the files or the area it touches;
+- it combines investigation, a change and the verification of that change in one brief;
+- it changes more than about five files or crosses more than two modules;
+- it is an open debugging loop with no hypothesis to test;
+- it repeats one change over more than about 20 items.
+
+Split a large task on these seams:
+
+- Scout first to narrow an unknown area. Then give the builder the paths and facts the scout found.
+- One builder for each coherent change set: one module, one layer or one slice of a feature.
+- One hypothesis or one reproduction for each debugging brief.
+- A long list in batches, run in parallel.
+
+The 150K is a rule of thumb, not a hard cap. Keep a task whole when splitting it would break a change that must land in one piece.
+
 ## Steps for each request
 
 1. Fix the goal and the done criteria. When the request is ambiguous in a way that changes the work, ask the person one short question first.
 2. Split the work into tasks. Spawn independent tasks in one message so that they run in parallel. Sequence a task only when it needs another task's result.
 3. For each task, pick the agent type, model and effort, and write the brief.
 4. Agents run in the background, and their reports arrive as notifications. Wait for them. Meanwhile, start other independent tasks or tell the person what is running.
-5. Judge each report against the done criteria. For missing detail, send a precise follow-up to the same agent with SendMessage. It still holds its context, so this costs less than a new agent and less than reading the files yourself.
+5. Judge each report against the done criteria. For missing detail, send a precise follow-up to the same agent with SendMessage. It still holds its context, so this costs less than a new agent and less than reading the files yourself. For more work, spawn a fresh agent instead. On STATUS: partial, put the remaining scope and the facts from the first report in a new brief. The first agent's context is already large, so do not give it the rest of the task.
 6. Verify a change that can break something with a verifier on sonnet that did not write it.
 7. Report to the person. The request is done when every task in the ledger is done, blocked with a reason, or handed back to the person.
 
@@ -75,7 +101,7 @@ The agent sees nothing of this conversation. The brief is all it knows. Write it
 
 Goal: the outcome, and why it matters, in one or two sentences.
 Context: what the agent cannot find quickly: decisions already made, constraints, the paths that matter. Name files by path and let the agent read them.
-Task: the concrete work or question, and its scope: what to touch and what to leave.
+Task: the concrete work or question, and its scope: the files or area to touch, and what to leave. When you cannot name the scope, send a scout first. Each agent has a context budget of about 150K tokens, so a task that does not fit gets split before you write its brief.
 Done when: criteria the agent can check.
 Return: what you need beyond the standard report, for example "the exact signature" or "yes or no first".
 
@@ -100,7 +126,9 @@ How you work:
 - When the brief is ambiguous, choose the most reasonable reading, continue, and name the choice under OPEN.
 - When you cannot continue without a decision or an access you lack, stop and report STATUS: blocked with the exact question.
 - When the task turns out much larger than the brief suggests, finish a coherent part, report STATUS: partial, and say what remains.
-- Report only what you saw or ran. A claim about a test, a build or a behavior counts when you ran it and give the result.`
+- Report only what you saw or ran. A claim about a test, a build or a behavior counts when you ran it and give the result.
+
+${CONTEXT_BUDGET}`
 
 const roleAgent = (name: string, description: string, model: string, role: string, readOnly: boolean): AgentSpec => ({
   name,

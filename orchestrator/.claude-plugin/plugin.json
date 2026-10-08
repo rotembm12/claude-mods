@@ -1,7 +1,7 @@
 {
   "name": "orchestrator",
-  "version": "0.2.1",
-  "description": "Turns a session into an orchestrator that delegates work to haiku and sonnet subagents, keeps its own context small, and lists the running and past agents in an expandable band (/orchestrator on|off|status)",
+  "version": "0.3.0",
+  "description": "Turns a session into an orchestrator that delegates work to haiku and sonnet subagents, keeps its own context small, sizes each task to about 150K tokens of subagent context, and lists the running and past agents in an expandable band (/orchestrator on|off|status)",
   "author": { "name": "Rotem" },
   "types": "./types/index.d.ts"
 }
