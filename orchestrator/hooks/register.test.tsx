@@ -2,15 +2,17 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { AgentSpawnInput, On } from 'claude-code'
 
+import { ROLES } from './prompts'
+
 const SURFACES = ['terminal', 'desktop'] as const
 const PLUGIN = 'orchestrator'
 const BASE = { id: 'intro', text: 'You are Claude Code.', scope: 'shared' } as const
 const ENGINE = { plugin: 'engine', tier: 'core' } as const
 
-const band = (hasSurvey = false, bodyColumns = 80) =>
+const band = (hasSurvey = false, bodyColumns = 80, maxRows = 10) =>
   ({
     component: 'AbovePrompt',
-    props: { hasSurvey, isWorking: false, maxRows: 10, bodyColumns, scroll: { offset: 0, bodyRows: 9 }, view: {} },
+    props: { hasSurvey, isWorking: false, maxRows, bodyColumns, scroll: { offset: 0, bodyRows: maxRows - 1 }, view: {} },
   }) as const
 
 type Setup = { store?: Record<string, unknown>; models?: Record<string, string> }
@@ -18,13 +20,13 @@ type Setup = { store?: Record<string, unknown>; models?: Record<string, string> 
 // Stand in for the engine beneath the plugin, and keep what reached it.
 function engine(on: On, setup: Setup = {}) {
   const store: Record<string, unknown> = { ...setup.store }
-  const seen = { store, prompts: [] as { text: string; context?: readonly string[] }[], spawned: [] as AgentSpawnInput[], roles: [] as string[], commands: [] as string[] }
+  const clock = mock.clock(on)
+  const seen = { store, clock, prompts: [] as { text: string; context?: readonly string[] }[], spawned: [] as AgentSpawnInput[], roles: [] as string[], commands: [] as string[] }
   on('store.get', (_$, e) => ({ value: store[e.key] }))
   on('store.set', (_$, e) => {
     store[e.key] = JSON.parse(JSON.stringify(e.value))
     return { value: undefined }
   })
-  mock.clock(on)
   on('session.id', () => ({ value: 'session-a' }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => {
@@ -50,6 +52,7 @@ function engine(on: On, setup: Setup = {}) {
     return { model: setup.models?.[e.subagentType] ?? e.model ?? 'claude-opus-5-5', agentId: `agent-${seen.spawned.length}` }
   })
   on('tool.call', (_$, e) => ({ result: {} as never, text: e.tool === 'Read' ? 'x'.repeat(e.file_path === 'big.ts' ? 12_000 : 200) : 'ok' }))
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
   return seen
 }
 
@@ -132,17 +135,52 @@ test("a teammate's render of the lead's prompt carries no section", async ($, on
   expect(await compose($, ['teammate'])).toEqual(['intro'])
 })
 
-test('while on, an Agent call needs a model, a fork does not, and a subagent cannot spawn', async ($, on) => {
+test('while on, an Agent call needs a haiku or sonnet model, a fork is refused, and a subagent cannot spawn', async ($, on) => {
   engine(on)
   expect('deny' in (await callAgent($, {}))).toBe(false)
+  expect('deny' in (await callAgent($, { model: 'opus' }))).toBe(false)
+  expect('deny' in (await callAgent($, { subagent_type: 'fork' }))).toBe(false)
 
   await run($, 'on')
   const missing = await callAgent($, { subagent_type: 'orchestrator:scout' })
-  expect(missing.deny).toContain('pass `model`')
-  expect(missing.deny).toBeDefined()
+  expect(missing.deny).toContain('pass `model` (haiku or sonnet)')
   expect((await callAgent($, { subagent_type: 'orchestrator:scout', model: 'haiku' })).deny).toBeUndefined()
-  expect((await callAgent($, { subagent_type: 'fork' })).deny).toBeUndefined()
+  expect((await callAgent($, { subagent_type: 'orchestrator:builder', model: 'sonnet' })).deny).toBeUndefined()
+  expect((await callAgent($, { subagent_type: 'orchestrator:verifier', model: 'opus' })).deny).toContain('never opus or fable')
+  expect((await callAgent($, { subagent_type: 'general-purpose', model: 'fable' })).deny).toContain('never opus or fable')
+  expect((await callAgent($, { subagent_type: 'fork' })).deny).toContain('forks are refused')
   expect((await callAgent($, { model: 'sonnet', agentId: 'agent-7' })).deny).toContain('only the orchestrator spawns')
+})
+
+test('the roles run on haiku and sonnet only', () => {
+  expect(ROLES.map(role => [role.name, role.model])).toEqual([
+    ['scout', 'haiku'],
+    ['builder', 'sonnet'],
+    ['verifier', 'sonnet'],
+  ])
+})
+
+test('while on, a spawn on opus or fable, a fork, or one with no model is refused, and a role runs on its own', async ($, on) => {
+  const seen = engine(on)
+  await run($, 'on')
+
+  expect((await spawn($, 'general-purpose')).deny).toContain('haiku or sonnet')
+  expect((await spawn($, 'Explore', { model: 'claude-opus-5-5' })).deny).toContain('haiku or sonnet')
+  expect((await spawn($, 'Plan', { model: 'fable' })).deny).toContain('haiku or sonnet')
+  expect((await spawn($, 'fork')).deny).toContain('forks are refused')
+  // A workflow's agent is refused without a model, and runs with one.
+  const workflow = { workflow: { runId: 'wf_1', agentIndex: 1 } }
+  expect((await spawn($, 'general-purpose', workflow)).deny).toContain('agent() call')
+  expect((await spawn($, 'general-purpose', { ...workflow, model: 'haiku' })).deny).toBeUndefined()
+  // A spawn inside a subagent is held to the same models.
+  expect((await spawn($, 'general-purpose', { model: 'opus', parentAgentId: 'agent-3' })).deny).toContain('haiku or sonnet')
+  expect((await spawn($, 'orchestrator:verifier')).deny).toBeUndefined()
+  expect(seen.spawned.map(s => s.subagentType)).toEqual(['general-purpose', 'orchestrator:verifier'])
+
+  // While off, the mod leaves every spawn alone.
+  await run($, 'off')
+  expect((await spawn($, 'general-purpose', { model: 'opus' })).deny).toBeUndefined()
+  expect((await spawn($, 'fork')).deny).toBeUndefined()
 })
 
 test('while on, built-in agents get the report contract, roles do not, and the band counts tiers', async ($, on) => {
@@ -154,17 +192,78 @@ test('while on, built-in agents get the report contract, roles do not, and the b
   await spawn($, 'Explore', { model: 'sonnet' })
   await spawn($, 'orchestrator:scout')
   await spawn($, 'orchestrator:scout')
-  await spawn($, 'fork')
-  await spawn($, 'general-purpose', { model: 'opus', parentAgentId: 'agent-3' })
 
   expect(seen.spawned[1]?.prompt).toContain('STATUS: done | partial | blocked | failed')
   expect(seen.spawned[2]?.prompt).toBe('Goal: find the retry logic')
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ plugin: PLUGIN, surface, ...band() })
-    expect(await ui.find({ type: 'Text', text: 'delegating · 1 sonnet · 2 haiku · 1 fork' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /delegating · 3 running · 1 sonnet · 2 haiku/ })).toBeDefined()
     await ui.unmount()
   }
-  expect((await run($, 'status')).text).toBe('Orchestrator mode is on. Agents started while on: 1 sonnet, 2 haiku, 1 fork.')
+  expect((await run($, 'status')).text).toBe('Orchestrator mode is on. Agents started while on: 1 sonnet, 2 haiku. 3 still running.')
+})
+
+const finish = ($: Engine, agentId: string, answer: string, durationMs: number, reason: 'answer' | 'aborted' | 'error' = 'answer') =>
+  $.turn.complete({ agentId, answer, durationMs, reason, isAborted: reason === 'aborted', turnId: `turn-${agentId}` })
+
+test('the details button opens a list of the running and the past agents', async ($, on) => {
+  const seen = engine(on, { models: { 'orchestrator:scout': 'claude-haiku-4-5-20251001' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:scout', { name: 'scout-auth', description: 'find the auth flow' })
+  await spawn($, 'orchestrator:builder', { model: 'sonnet', name: 'builder-retry' })
+  await spawn($, 'Explore', { model: 'haiku', description: 'list the tests' })
+
+  // The scout reads a file, then its report comes back. A subagent's own call:
+  // its loop's id rides the call, as a session stamps it.
+  const scoutRead = { tool: 'Read' as const, file_path: 'auth.ts', agentId: 'agent-1' }
+  await $.tool.call(scoutRead)
+  await finish($, 'agent-1', 'STATUS: partial\nANSWER: found half of it', 65_000)
+  // The builder works on, and the Explore agent is stopped.
+  const builderGrep = { tool: 'Grep' as const, pattern: 'retry', agentId: 'agent-2' }
+  const builderEdit = { tool: 'Edit' as const, file_path: 'retry.ts', old_string: 'a', new_string: 'b', agentId: 'agent-2' }
+  await $.tool.call(builderGrep)
+  await $.tool.call(builderEdit)
+  await finish($, 'agent-3', '', 4_000, 'aborted')
+  await seen.clock.advance(125_000)
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ plugin: PLUGIN, surface, ...band() })
+    expect(await ui.find({ type: 'Text', text: /delegating · 1 running · 1 sonnet · 2 haiku/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /scout-auth/ })).toBeUndefined()
+
+    await ui.press({ key: 'orchestrator-details' })
+    expect(await ui.find({ type: 'Text', text: 'builder-retry · builder · sonnet · running · 2m 05s · 2 tools · Edit' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'scout-auth · scout · haiku · partial · 1m 05s · 1 tool' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'list the tests · Explore · haiku · killed · 4s · 0 tools' })).toBeDefined()
+
+    await ui.press({ key: 'orchestrator-details' })
+    expect(await ui.find({ type: 'Text', text: /scout-auth/ })).toBeUndefined()
+    await ui.unmount()
+  }
+
+  // A follow-up message wakes the scout: it runs again, its time so far kept.
+  const followUpRead = { tool: 'Read' as const, file_path: 'session.ts', agentId: 'agent-1' }
+  await $.tool.call(followUpRead)
+  await seen.clock.advance(5_000)
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...band() })
+  await ui.press({ key: 'orchestrator-details' })
+  expect(await ui.find({ type: 'Text', text: 'scout-auth · scout · haiku · running · 1m 10s · 2 tools · Read' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the open list fits the rows the band has, and says how many more there are', async ($, on) => {
+  engine(on)
+  await run($, 'on')
+  for (let i = 1; i <= 15; i++) await spawn($, 'Explore', { model: 'haiku', name: `scout-${i}` })
+
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...band(false, 80, 10) })
+  await ui.press({ key: 'orchestrator-details' })
+  // Nine rows under the switch: eight agents, newest first, and the "more" row.
+  expect(await ui.find({ type: 'Text', text: /^scout-15 ·/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^scout-8 ·/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^scout-7 ·/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /7 more/ })).toBeDefined()
+  await ui.unmount()
 })
 
 test('while on, a large direct read gets a note with its size, and a small one does not', async ($, on) => {
@@ -203,6 +302,8 @@ test('the band shows the switch off, and a press switches the mode', async ($, o
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ plugin: PLUGIN, surface, ...band() })
     expect(await ui.find({ type: 'Text', text: 'Claude works directly' })).toBeDefined()
+    // With no agents yet, there is no list to open.
+    expect(await ui.find({ key: 'orchestrator-details' })).toBeUndefined()
     // The band other plugins drew stays, under the switch.
     expect(await ui.find({ type: 'Text', text: 'engine band' })).toBeDefined()
 
