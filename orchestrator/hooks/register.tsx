@@ -1,7 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentDetails, AgentRun, AgentStep, Saved } from '../types'
+import type { AgentDetails, AgentRequest, AgentRun, AgentStep, Saved } from '../types'
+import { clean, clip, GLYPHS, labelOf, ROLE_PREFIX, statusOf, stateOf, timeOf, toolsOf, typeOf } from './format'
+import { renderPane } from './pane'
 import { CONTEXT_BUDGET, MODELS, ORCHESTRATOR_PROMPT, REPORT_CONTRACT, ROLES } from './prompts'
 
 const IS_ON = { plugin: 'orchestrator', key: 'isOn' } as const
@@ -13,26 +15,24 @@ const selected = atom({ plugin: 'orchestrator', key: 'selected' } as const, null
 // The brief and report of each listed agent, apart from `agents`, which every
 // subagent tool call rewrites and the band reads on each redraw.
 const details = atom({ plugin: 'orchestrator', key: 'details' } as const, {})
-const showAllSteps = atom({ plugin: 'orchestrator', key: 'showAllSteps' } as const, false)
-const showFullBrief = atom({ plugin: 'orchestrator', key: 'showFullBrief' } as const, false)
+// The step the details pane has open: another agent starts with none.
+const openStep = atom({ plugin: 'orchestrator', key: 'openStep' } as const, null)
 
 const SECTION_ID = 'orchestrator:mode'
 // The pane that shows one agent: the row pressed last.
 const DETAILS_PANE = 'orchestrator-agent'
 // What a run keeps of its brief and its report, for the details pane.
-const KEEP_BRIEF_CHARS = 3000
-const KEEP_REPORT_CHARS = 3000
+const KEEP_BRIEF_CHARS = 20000
+const KEEP_REPORT_CHARS = 12000
 // The steps a run keeps, its latest, and how much of each one's target.
 const KEEP_STEPS = 80
 const KEEP_TARGET_CHARS = 160
-// What the pane shows of the brief until it is opened whole.
-const SHORT_BRIEF_LINES = 8
-// The widest bar of the tool mix, in cells, and the detail lines under a phase.
-const BAR_CELLS = 40
-const PHASE_LINES = 3
-// The phases the pane shows until every call is opened.
-const SHOWN_PHASES = 10
-const ROLE_PREFIX = 'orchestrator:'
+// How much of a call's input and of its output a step keeps, and how many of the
+// newest agents keep them at all: they are most of the state's size.
+const KEEP_IO_CHARS = 600
+const KEEP_IO_AGENTS = 15
+// The model requests a run keeps, its latest.
+const KEEP_REQUESTS = 150
 const STORE_KEY = 'sessions'
 const KEEP_SESSIONS = 100
 const KEEP_AGENTS = 50
@@ -108,63 +108,18 @@ function ledger(runs: AgentRun[]): string[] {
     .map(([tier, n]) => `${n} ${tier}`)
 }
 
-function clip(text: string, width: number): string {
-  if (width <= 0) return ''
-  return text.length <= width ? text : `${text.slice(0, Math.max(0, width - 1))}…`
-}
-
-function duration(ms: number): string {
-  const seconds = Math.max(0, Math.round(ms / 1000))
-  if (seconds < 60) return `${seconds}s`
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, '0')}s`
-  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`
-}
-
-const GLYPHS: Record<AgentRun['status'], [string, string]> = {
-  running: ['●', 'warning'],
-  completed: ['✓', 'success'],
-  failed: ['✗', 'error'],
-  killed: ['■', 'inactive'],
-}
-
-const labelOf = (run: AgentRun) => run.name ?? run.description
-const typeOf = (run: AgentRun) => (run.type.startsWith(ROLE_PREFIX) ? run.type.slice(ROLE_PREFIX.length) : run.type)
-const stateOf = (run: AgentRun) =>
-  run.status === 'running' ? 'running' : run.status === 'completed' ? (run.outcome ?? 'done') : run.status
-const timeOf = (run: AgentRun, now: number) => duration(run.runMs + (run.status === 'running' ? now - run.since : 0))
-const toolsOf = (run: AgentRun) => `${run.tools} ${run.tools === 1 ? 'tool' : 'tools'}`
-
 // One line of the open list: who it is, its model, where it stands, how long, and what it did.
 function describe(run: AgentRun, now: number): string {
   const last = run.status === 'running' && run.lastTool !== null ? ` · ${run.lastTool}` : ''
   return `${labelOf(run)} · ${typeOf(run)} · ${run.tier} · ${stateOf(run)} · ${timeOf(run, now)} · ${toolsOf(run)}${last}`
 }
 
-const keep = (text: string, chars: number) => (text.length <= chars ? text : `${text.slice(0, chars)}\n… (${text.length - chars} more characters)`)
-
-// The kind of work a tool does, by the color its name is drawn in.
-const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
-const RUN_TOOLS = new Set(['Bash', 'PowerShell'])
-const WEB_TOOLS = new Set(['WebFetch', 'WebSearch'])
-const FIND_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS', 'NotebookRead'])
-function toolColor(tool: string): string {
-  if (EDIT_TOOLS.has(tool)) return 'success'
-  if (RUN_TOOLS.has(tool)) return 'warning'
-  if (WEB_TOOLS.has(tool)) return 'remember'
-  if (FIND_TOOLS.has(tool)) return 'suggestion'
-  return 'claude'
+const keep = (text: string, chars: number) => {
+  const plain = clean(text)
+  return plain.length <= chars ? plain : `${plain.slice(0, chars)}\n… (${plain.length - chars} more characters)`
 }
-
-// How each way an agent can stand is colored: its card's border and its chip.
-const TONES: Record<string, string> = {
-  running: 'suggestion',
-  done: 'success',
-  partial: 'warning',
-  blocked: 'warning',
-  failed: 'error',
-  killed: 'inactive',
-}
+// A token count as the API reported it; a field it left out is none.
+const count = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
 
 // The keys a tool call carries that are no argument of the tool's.
 const RESERVED = new Set(['tool', 'tool_use_id', 'agentId', 'consent'])
@@ -201,115 +156,10 @@ function targetOf(tool: string, input: Record<string, unknown>, cwd: string): { 
   return { target: other !== undefined ? firstLine(String(other[1]).trim()) : '' }
 }
 
-// A step's start, as minutes and seconds after the agent's.
-function clockOf(ms: number): string {
-  const seconds = Math.max(0, Math.floor(ms / 1000))
-  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
-}
-
-// "claude-haiku-5-5" as "Haiku 5.5"; a model id of another shape shows its tier.
-function modelName(model: string | undefined, tier: string): string {
-  const match = /^claude-([a-z]+)-(\d+)-(\d+)/.exec(model ?? '')
-  const name = match?.[1] ?? tier
-  const pretty = name.charAt(0).toUpperCase() + name.slice(1)
-  return match?.[2] !== undefined ? `${pretty} ${match[2]}.${match[3]}` : pretty
-}
-
-// The agent's steps as a story: consecutive steps of one kind form a phase.
-type PhaseKind = 'explore' | 'research' | 'edit' | 'run' | 'other'
-type Phase = { kind: PhaseKind; steps: AgentStep[] }
-const kindOf = (tool: string): PhaseKind =>
-  FIND_TOOLS.has(tool) ? 'explore' : WEB_TOOLS.has(tool) ? 'research' : EDIT_TOOLS.has(tool) ? 'edit' : RUN_TOOLS.has(tool) ? 'run' : 'other'
-function phasesOf(steps: AgentStep[]): Phase[] {
-  const phases: Phase[] = []
-  for (const step of steps) {
-    const kind = kindOf(step.tool)
-    const last = phases.at(-1)
-    if (last !== undefined && last.kind === kind) last.steps.push(step)
-    else phases.push({ kind, steps: [step] })
-  }
-  return phases
-}
-const PHASE_LABELS: Record<PhaseKind, string> = { explore: 'Explored', research: 'Researched', edit: 'Edited', run: 'Ran commands', other: '' }
-const phaseLabel = (phase: Phase) =>
-  phase.kind === 'other' ? `Used ${[...new Set(phase.steps.map(s => s.tool))].join(', ')}` : PHASE_LABELS[phase.kind]
-// ① to ⑳, then plain numbers.
-const marker = (n: number) => (n >= 1 && n <= 20 ? String.fromCodePoint(0x2460 + n - 1) : String(n))
-
-// Cells for each tool in a bar of `cells`: in proportion to its count, one at least.
-function barCells(counts: number[], cells: number): number[] {
-  const total = counts.reduce((a, b) => a + b, 0)
-  if (total === 0) return []
-  const sizes = counts.map(n => Math.max(1, Math.round((n / total) * cells)))
-  const widest = () => sizes.indexOf(Math.max(...sizes))
-  while (sizes.reduce((a, b) => a + b, 0) > cells && Math.max(...sizes) > 1) sizes[widest()]!--
-  while (sizes.reduce((a, b) => a + b, 0) < cells) sizes[widest()]!++
-  return sizes
-}
-// Tools that share a color take turns at these, so they stay apart.
-const FILLS = ['█', '▓', '▒', '░']
-const SWATCHES = ['■', '▓', '▒', '░']
-
-// A report split by the contract's fields; null when it follows none of them.
-type Report = { status?: string; answer?: string; evidence?: string; changes?: string; open?: string; notes: string }
-const FIELD = /^\s*(?:[-*>#]+\s*)?\**(STATUS|ANSWER|EVIDENCE|CHANGES|OPEN)\**\s*:\**\s*/
-// The first word of a status, lowercase, with the markdown and the punctuation around it gone.
-const wordOf = (text: string) => /^[^A-Za-z]*([A-Za-z]+)/.exec(text)?.[1]?.toLowerCase()
-// The STATUS a report opens with, as a field in any of the forms FIELD reads.
-function statusOf(report: string): string | undefined {
-  for (const line of report.split('\n')) {
-    const match = FIELD.exec(line)
-    if (match?.[1] === 'STATUS') return wordOf(line.slice(match[0].length))
-  }
-  return undefined
-}
-function parseReport(report: string): Report | null {
-  const fields: Record<string, string[]> = {}
-  const notes: string[] = []
-  let current: string | null = null
-  for (const line of report.split('\n')) {
-    const match = FIELD.exec(line)
-    if (match?.[1] !== undefined) {
-      current = match[1].toLowerCase()
-      fields[current] = [line.slice(match[0].length)]
-    } else if (current !== null) fields[current]?.push(line)
-    else notes.push(line)
-  }
-  if (fields.status === undefined && fields.answer === undefined) return null
-  const field = (name: string) => {
-    const text = fields[name]?.join('\n').trim()
-    return text === undefined || text === '' ? undefined : text
-  }
-  return {
-    status: wordOf(field('status') ?? ''),
-    answer: field('answer'),
-    evidence: field('evidence'),
-    changes: field('changes'),
-    open: field('open'),
-    notes: notes.join('\n').trim(),
-  }
-}
-
-// path:line references read as code, where the line has none of its own.
-function codeRefs(line: string): string {
-  if (line.includes('`')) return line
-  return line.replace(/(^|[\s(])((?:[\w.@-]+\/)*[\w.@-]+\.[A-Za-z0-9]+:\d+(?:-\d+)?)(?=[\s),;]|\.(?:\s|$)|$)/g, '$1`$2`')
-}
-
-// One line of a report field, or its lines as a list: one item per line, or per
-// "; " when the agent wrote them on one line.
-function listify(body: string): string {
-  const lines = body.split('\n').map(l => l.trim()).filter(l => l !== '')
-  const items = lines.length === 1 && (lines[0] ?? '').includes('; ') ? (lines[0] ?? '').split(/;\s+/) : lines
-  if (items.length === 1) return codeRefs(items[0] ?? '')
-  return items.map(item => (/^([-*]|\d+[.)])\s/.test(item) ? codeRefs(item) : `- ${codeRefs(item.replace(/^•\s*/, ''))}`)).join('\n')
-}
-
-// Markdown joins a paragraph's lines: keep each line of plain text on its own.
-const hardBreaks = (text: string) => text.replace(/([^\n])\n(?=[^\n])/g, '$1  \n')
-
 // A press on a row: the details pane shows that agent, opened or retitled.
 async function showAgent($: EngineInterface, run: AgentRun) {
+  // Another agent has no step open yet.
+  if ((await read($, selected)) !== run.id) await update($, openStep, () => null)
   await update($, selected, () => run.id)
   await $.ui.open({ id: DETAILS_PANE, title: `Agent · ${clip(labelOf(run), 40)}` })
 }
@@ -356,11 +206,35 @@ async function changeRun($: EngineInterface, id: string, change: (run: AgentRun,
   await update($, agents, (list: AgentRun[]) => list.map(r => (r.id === id ? change(r, now) : r)))
 }
 
+// A call's arguments as JSON, the keys that are no argument of the tool's left out.
+function inputOf(input: Record<string, unknown>): string {
+  try {
+    const args = Object.fromEntries(Object.entries(input).filter(([key]) => !RESERVED.has(key)))
+    return keep(JSON.stringify(args, null, 2) ?? '', KEEP_IO_CHARS)
+  } catch {
+    return ''
+  }
+}
+
+// What a call answered: the deny, else its text, else its result as JSON.
+function outputOf(result: { deny?: unknown; text?: unknown; result?: unknown }): string {
+  try {
+    if (result.deny !== undefined) return keep(String(result.deny), KEEP_IO_CHARS)
+    if (result.text !== undefined && result.text !== null) return keep(String(result.text), KEEP_IO_CHARS)
+    return keep(JSON.stringify(result.result, null, 2) ?? '', KEEP_IO_CHARS)
+  } catch {
+    return ''
+  }
+}
+
 // Adds a running step to an agent the mod keeps details of, and answers its
-// number, or null for an agent it keeps none of.
-async function startStep($: EngineInterface, id: string, tool: string, input: Record<string, unknown>): Promise<number | null> {
-  const run = ((await read($, agents)) as AgentRun[]).find(r => r.id === id)
-  if (run === undefined || (await read($, details))[id] === undefined) return null
+// number and whether it keeps the call's input and output, or null for an agent
+// it keeps no details of.
+async function startStep($: EngineInterface, id: string, tool: string, input: Record<string, unknown>): Promise<{ n: number; withIo: boolean } | null> {
+  const runs = (await read($, agents)) as AgentRun[]
+  const run = runs.find(r => r.id === id)
+  if (run === undefined) return null
+  const withIo = runs.slice(-KEEP_IO_AGENTS).some(r => r.id === id)
   const cwd = await $.session.cwd().catch(() => '')
   const now = await $.clock.now()
   const { target, path } = targetOf(tool, input, cwd)
@@ -370,10 +244,19 @@ async function startStep($: EngineInterface, id: string, tool: string, input: Re
     if (kept === undefined) return all
     const steps = kept.steps ?? []
     n = (steps.at(-1)?.n ?? 0) + 1
-    const step: AgentStep = { n, tool, target: clip(target, KEEP_TARGET_CHARS), ...(path !== undefined ? { path } : {}), at: now - run.startedAt, ms: null, isError: false }
+    const step: AgentStep = {
+      n,
+      tool: clean(tool),
+      target: clip(clean(target), KEEP_TARGET_CHARS),
+      ...(path !== undefined ? { path: clip(clean(path), KEEP_TARGET_CHARS) } : {}),
+      at: now - run.startedAt,
+      ms: null,
+      isError: false,
+      ...(withIo ? { input: inputOf(input) } : {}),
+    }
     return { ...all, [id]: { ...kept, steps: [...steps, step].slice(-KEEP_STEPS) } }
   })
-  return n
+  return n === null ? null : { n, withIo }
 }
 
 export const register: Register = on => {
@@ -511,375 +394,8 @@ export const register: Register = on => {
     )
   })
 
-  // The details pane: the agent whose row was pressed last. A card says who it
-  // is and where it stands; then what it achieved, the story of its work, and its brief.
-  on('ui.render', { component: 'Pane', requestId: DETAILS_PANE }, async ($, e) => {
-    const { Box, Button, Markdown, Text } = $.ui.resolve(e)
-    const id = await read($, selected)
-    const runs: AgentRun[] = await read($, agents)
-    const run = runs.find(r => r.id === id)
-    if (run === undefined) return <Text dimColor>No agent to show. Open the band's details and click an agent.</Text>
-    const kept: AgentDetails | undefined = (await read($, details))[run.id]
-    const allSteps = await read($, showAllSteps)
-    const fullBrief = await read($, showFullBrief)
-
-    const now = await $.clock.now()
-    const isTerminal = e.surface === 'terminal'
-    // The card's border and padding take four columns.
-    const width = Math.max(16, e.props.bodyColumns) - 4
-    const [glyph, glyphColor] = GLYPHS[run.status]
-    const word = stateOf(run)
-    const tone = TONES[word] ?? glyphColor
-    const steps = kept?.steps ?? []
-    const report = kept?.report ?? null
-    const parsed = report !== null ? parseReport(report) : null
-
-    const edited = [...new Set(steps.filter(s => EDIT_TOOLS.has(s.tool) && s.path !== undefined).map(s => s.path as string))]
-    const readFiles = [...new Set(steps.filter(s => s.tool === 'Read' && s.path !== undefined).map(s => s.path as string))]
-    const failedCalls = steps.filter(s => s.isError).length
-
-    const chip = (label: string, color: string) => (
-      <Text backgroundColor={color} color="inverseText" bold>
-        {` ${label.toUpperCase()} `}
-      </Text>
-    )
-    const heading = (title: string, aside?: string) => (
-      <Box marginTop={isTerminal ? 1 : 2}>
-        <Text bold size="heading" color={isTerminal ? 'claude' : undefined}>
-          {isTerminal ? `▍${title.toUpperCase()}` : title}
-        </Text>
-        {aside !== undefined && <Text dimColor size="footnote">{`  ${aside}`}</Text>}
-      </Box>
-    )
-    const label = (title: string, color?: string) => (
-      <Box marginTop={1}>
-        <Text bold color={color}>
-          {title}
-        </Text>
-      </Box>
-    )
-
-    // Who it is and where it stands.
-    const stats: [string, string][] = [
-      [timeOf(run, now), run.status === 'running' ? 'so far' : 'run time'],
-      [String(run.tools), run.tools === 1 ? 'tool call' : 'tool calls'],
-      ...(readFiles.length > 0 ? [[String(readFiles.length), readFiles.length === 1 ? 'file read' : 'files read'] as [string, string]] : []),
-      ...(edited.length > 0 ? [[String(edited.length), edited.length === 1 ? 'file edited' : 'files edited'] as [string, string]] : []),
-      ...(failedCalls > 0 ? [[String(failedCalls), failedCalls === 1 ? 'failed call' : 'failed calls'] as [string, string]] : []),
-    ]
-    const statRow = isTerminal ? (
-      <Box marginTop={1} flexWrap="wrap">
-        {stats.map(([value, what], i) => (
-          <Box key={`orchestrator-stat-${what}`}>
-            <Text bold tabular>
-              {value}
-            </Text>
-            <Text dimColor>{` ${what}`}</Text>
-            {i < stats.length - 1 && <Text dimColor>{'  ·  '}</Text>}
-          </Box>
-        ))}
-      </Box>
-    ) : (
-      <Box marginTop={1} flexWrap="wrap" gap={1}>
-        {stats.map(([value, what]) => (
-          <Box key={`orchestrator-stat-${what}`} flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
-            <Text size="title" bold tabular>
-              {value}
-            </Text>
-            <Text size="caption" dimColor>
-              {what}
-            </Text>
-          </Box>
-        ))}
-      </Box>
-    )
-    // Its role, model and age, each clipped to what is left of the line.
-    let room = width
-    const identity: [string, string | undefined, boolean][] = []
-    for (const [text, color, isDim] of [
-      [typeOf(run), toolColor(typeOf(run)), false],
-      [' · ', undefined, true],
-      [modelName(run.model, run.tier), undefined, false],
-      [` · started ${duration(now - run.startedAt)} ago`, undefined, true],
-    ] as [string, string | undefined, boolean][]) {
-      const shown = clip(text, room)
-      room -= shown.length
-      if (shown !== '') identity.push([shown, color, isDim])
-    }
-    const card = (
-      <Box flexDirection="column" borderStyle="round" borderColor={tone} paddingX={1}>
-        <Box justifyContent="space-between">
-          <Box flexShrink={1}>
-            <Text color={glyphColor}>{`${glyph} `}</Text>
-            <Text bold size="title">
-              {labelOf(run)}
-            </Text>
-          </Box>
-          {chip(word, tone)}
-        </Box>
-        {run.name !== null && <Text>{run.description}</Text>}
-        <Box>
-          {identity.map(([text, color, isDim], i) => (
-            <Text key={`orchestrator-identity-${i}`} color={color} dimColor={isDim}>
-              {text}
-            </Text>
-          ))}
-        </Box>
-        {statRow}
-      </Box>
-    )
-
-    // What it achieved: the report, by the contract's fields, the answer boxed in its state's color.
-    const latest = steps.at(-1)
-    const answerBox = (caption: string, body: ReturnType<typeof Markdown> | (JSX.Element | false)[]) => (
-      <Box flexDirection="column" borderStyle="round" borderColor={tone} paddingX={1}>
-        <Text dimColor size="caption">
-          {caption}
-        </Text>
-        {body}
-      </Box>
-    )
-    let outcome
-    if (report === null) {
-      outcome =
-        run.status === 'running' ? (
-          <Box flexDirection="column">
-            <Text color="suggestion">● Working</Text>
-            {latest !== undefined && (
-              <Box>
-                <Text dimColor>{'now: '}</Text>
-                <Text color={toolColor(latest.tool)}>{latest.tool}</Text>
-                <Text>{` ${clip(latest.target, width - latest.tool.length - 6)}`}</Text>
-              </Box>
-            )}
-          </Box>
-        ) : (
-          <Text dimColor>{run.status === 'killed' ? 'Stopped before it reported.' : 'No report.'}</Text>
-        )
-    } else if (parsed === null) {
-      outcome = answerBox('Report', <Markdown key="orchestrator-report" text={hardBreaks(report)} />)
-    } else {
-      const verdict = /^(PASS|FAIL|CONCERNS)\b[\s:.,-]*/.exec(parsed.answer ?? '')
-      const verdictTone = verdict?.[1] === 'PASS' ? 'success' : verdict?.[1] === 'FAIL' ? 'error' : 'warning'
-      const answer = verdict !== null ? (parsed.answer ?? '').slice(verdict[0].length) : parsed.answer
-      const hasAnswer = answer !== undefined && answer !== ''
-      const evidence =
-        parsed.evidence !== undefined ? (
-          <Box key="orchestrator-evidence-block" flexDirection="column">
-            {label('⌕ Evidence', 'suggestion')}
-            <Markdown key="orchestrator-evidence" text={hardBreaks(listify(parsed.evidence))} />
-          </Box>
-        ) : null
-      const open =
-        parsed.open !== undefined ? (
-          <Box key="orchestrator-open-block" flexDirection="column">
-            {label('⚑ Open questions & risks', 'warning')}
-            <Markdown key="orchestrator-open" text={hardBreaks(listify(parsed.open))} />
-          </Box>
-        ) : null
-      const openFirst = parsed.status === 'partial' || parsed.status === 'blocked'
-      outcome = (
-        <Box flexDirection="column">
-          {(verdict?.[1] !== undefined || hasAnswer) &&
-            answerBox('Answer', [
-              verdict?.[1] !== undefined && (
-                <Box key="orchestrator-verdict" marginBottom={hasAnswer ? 1 : 0}>
-                  {chip(verdict[1], verdictTone)}
-                </Box>
-              ),
-              hasAnswer && <Markdown key="orchestrator-answer" text={hardBreaks(codeRefs(answer))} />,
-            ])}
-          {parsed.changes !== undefined && label('✎ Changes', 'success')}
-          {parsed.changes !== undefined && <Markdown key="orchestrator-changes" text={hardBreaks(listify(parsed.changes))} />}
-          {openFirst ? open : evidence}
-          {openFirst ? evidence : open}
-          {parsed.notes !== '' && label('Notes')}
-          {parsed.notes !== '' && <Markdown key="orchestrator-notes" dimColor text={hardBreaks(parsed.notes)} />}
-        </Box>
-      )
-    }
-
-    // What it did: its phases in order, the tools it used, its files, and every call.
-    const counts: Record<string, number> = {}
-    for (const step of steps) counts[step.tool] = (counts[step.tool] ?? 0) + 1
-    const mix = Object.entries(counts).sort((a, b) => b[1] - a[1])
-    const nameCells = Math.min(12, Math.max(4, ...steps.map(s => s.tool.length)))
-    const dropped = (latest?.n ?? 0) - steps.length
-    const targetCells = width - 2 - 6 - nameCells - 1 - 6
-    const stepRow = (step: AgentStep) => {
-      const [mark, markColor] = step.ms === null ? ['●', 'warning'] : step.isError ? ['✗', 'error'] : ['✓', 'success']
-      return (
-        <Box key={`orchestrator-step-${step.n}`}>
-          <Text color={markColor} dimColor={markColor === 'success'}>{`${mark} `}</Text>
-          <Text dimColor mono tabular>
-            {clockOf(step.at).padStart(5)}
-          </Text>
-          <Text mono color={toolColor(step.tool)}>{` ${clip(step.tool, nameCells).padEnd(nameCells)} `}</Text>
-          <Box flexGrow={1} flexShrink={1}>
-            <Text color={step.isError ? 'error' : undefined}>{clip(step.target, targetCells)}</Text>
-          </Box>
-          {step.ms !== null && step.ms >= 1000 && <Text dimColor tabular>{` ${duration(step.ms)}`}</Text>}
-        </Box>
-      )
-    }
-
-    const phases = phasesOf(steps)
-    const earlier = allSteps ? 0 : Math.max(0, phases.length - SHOWN_PHASES)
-    const isWorking = run.status === 'running' && latest !== undefined && latest.ms === null
-    const lineCells = width - 4
-    const phaseView = (phase: Phase, index: number) => {
-      const first = phase.steps[0] as AgentStep
-      const last = phase.steps.at(-1) as AgentStep
-      const tally: Record<string, number> = {}
-      for (const step of phase.steps) tally[step.tool] = (tally[step.tool] ?? 0) + 1
-      const failed = phase.steps.filter(s => s.isError).length
-      // Up to three detail lines, then how many more there were.
-      const lines: { text: string; mark?: string; markColor?: string }[] =
-        phase.kind === 'edit'
-          ? [...new Set(phase.steps.map(s => s.path ?? s.target).filter(t => t !== ''))].map(path => ({ text: `✎ ${path}` }))
-          : phase.kind === 'run'
-            ? phase.steps.filter(s => s.target !== '').map(s => ({ text: s.target, mark: s.ms === null ? '●' : s.isError ? '✗' : '✓', markColor: s.ms === null ? 'warning' : s.isError ? 'error' : undefined }))
-            : [...new Set(phase.steps.map(s => s.target).filter(t => t !== ''))].map(text => ({ text }))
-      const shown = lines.slice(0, PHASE_LINES)
-      const more = lines.length - shown.length
-      const span = `${clockOf(first.at)}–${clockOf(last.ms !== null ? last.at + last.ms : last.at)}`
-      return (
-        <Box key={`orchestrator-phase-${index}`} flexDirection="column" marginTop={1}>
-          <Box flexWrap="wrap" columnGap={1}>
-            <Text bold color={toolColor(first.tool)}>{marker(index + 1)}</Text>
-            <Text bold color={toolColor(first.tool)}>{clip(phaseLabel(phase), width - 4)}</Text>
-            <Text dimColor>·</Text>
-            <Text dimColor tabular>{span}</Text>
-            <Text dimColor>·</Text>
-            <Text>{Object.entries(tally).map(([tool, n]) => `${tool} ×${n}`).join(' · ')}</Text>
-            {failed > 0 && <Text color="error">{`${failed} failed`}</Text>}
-            {isWorking && index === phases.length - 1 && <Text color="warning">● in progress</Text>}
-          </Box>
-          {shown.map((line, i) => (
-            <Box key={`orchestrator-phase-${index}-line-${i}`} paddingLeft={3}>
-              {line.mark !== undefined && <Text color={line.markColor} dimColor={line.markColor === undefined}>{`${line.mark} `}</Text>}
-              <Text dimColor={line.markColor !== 'error'} color={line.markColor === 'error' ? 'error' : undefined}>
-                {clip(line.text, lineCells - (line.mark !== undefined ? 2 : 0))}
-              </Text>
-            </Box>
-          ))}
-          {more > 0 && (
-            <Box paddingLeft={3}>
-              <Text dimColor>{`+${more} more`}</Text>
-            </Box>
-          )}
-        </Box>
-      )
-    }
-
-    // One bar for the tool mix: cells in proportion to each tool's calls. Where there
-    // are more tools than cells, the smallest share one "other" segment.
-    const barWidth = Math.min(BAR_CELLS, width)
-    const segments: [string, number][] =
-      mix.length > barWidth ? [...mix.slice(0, barWidth - 1), ['other', mix.slice(barWidth - 1).reduce((sum, [, n]) => sum + n, 0)]] : mix
-    const sizes = barCells(segments.map(([, n]) => n), barWidth)
-    const seenColors: Record<string, number> = {}
-    const fills = segments.map(([tool]) => {
-      const color = toolColor(tool)
-      const turn = seenColors[color] ?? 0
-      seenColors[color] = turn + 1
-      return turn % FILLS.length
-    })
-    const toolMix = (
-      <Box flexDirection="column">
-        <Box>
-          {segments.map(([tool], i) => (
-            <Text key={`orchestrator-bar-${tool}`} mono color={toolColor(tool)}>
-              {(FILLS[fills[i] as number] as string).repeat(sizes[i] as number)}
-            </Text>
-          ))}
-        </Box>
-        <Box marginTop={1} flexWrap="wrap" columnGap={2}>
-          {segments.map(([tool, n], i) => (
-            <Text key={`orchestrator-legend-${tool}`} mono color={toolColor(tool)}>{clip(`${SWATCHES[fills[i] as number]} ${tool} ${n}`, width)}</Text>
-          ))}
-        </Box>
-      </Box>
-    )
-
-    const activity =
-      steps.length === 0 ? (
-        <Text dimColor>
-          {kept?.steps === undefined && run.tools > 0
-            ? 'Steps not kept: this agent started before the mod kept them.'
-            : run.status === 'running'
-              ? 'No tool calls yet.'
-              : 'No tool calls: it answered from its brief.'}
-        </Text>
-      ) : (
-        <Box flexDirection="column">
-          {earlier > 0 && (
-            <Box marginTop={1}>
-              <Text dimColor>{`⋯ ${earlier} earlier ${earlier === 1 ? 'phase' : 'phases'}`}</Text>
-            </Box>
-          )}
-          {phases.slice(earlier).map((phase, i) => phaseView(phase, earlier + i))}
-          {label('Tool mix')}
-          {toolMix}
-          {edited.length > 0 && label('Files edited', 'success')}
-          {edited.map(path => (
-            <Text key={`orchestrator-edited-${path}`} mono>{`✎ ${clip(path, width - 2)}`}</Text>
-          ))}
-          {readFiles.length > 0 && label('Files read', 'suggestion')}
-          {readFiles.length > 0 && (
-            <Text dimColor>{clip(readFiles.slice(0, 6).join(', ') + (readFiles.length > 6 ? ` +${readFiles.length - 6} more` : ''), width * 2)}</Text>
-          )}
-          <Box marginTop={1}>
-            <Button
-              key="orchestrator-steps-toggle"
-              {...(isTerminal ? { plain: true as const } : { variant: 'secondary' as const })}
-              label={allSteps ? '▴ Hide the calls' : `▾ Show every call (${steps.length})`}
-              onPress={() => update($, showAllSteps, (open: boolean) => !open)}
-            />
-          </Box>
-          {allSteps && dropped > 0 && <Text dimColor>{`  The first ${dropped} calls were not kept.`}</Text>}
-          {allSteps && steps.map(stepRow)}
-        </Box>
-      )
-
-    // The brief it was given, as a quoted document.
-    const briefLines = kept?.brief.split('\n') ?? []
-    const isLong = briefLines.length > SHORT_BRIEF_LINES
-    const briefText = isLong && !fullBrief ? `${briefLines.slice(0, SHORT_BRIEF_LINES).join('\n')}\n…` : (kept?.brief ?? '')
-    const brief =
-      kept === undefined ? (
-        <Text dimColor>Not kept: this agent started before the mod kept briefs.</Text>
-      ) : (
-        <Box flexDirection="column">
-          <Box borderStyle="round" borderDimColor paddingX={1}>
-            <Markdown key="orchestrator-brief" text={hardBreaks(briefText)} />
-          </Box>
-          {isLong && (
-            <Box marginTop={1}>
-              <Button
-                key="orchestrator-brief-toggle"
-                {...(isTerminal ? { plain: true as const } : { variant: 'secondary' as const })}
-                label={fullBrief ? '▴ Show less' : `▾ Show the full brief (${briefLines.length} lines)`}
-                onPress={() => update($, showFullBrief, (open: boolean) => !open)}
-              />
-            </Box>
-          )}
-        </Box>
-      )
-
-    const stepsAside = `${toolsOf(run)}${failedCalls > 0 ? ` · ${failedCalls} failed` : ''}${run.status === 'running' && run.lastTool !== null ? ` · last ${run.lastTool}` : ''}`
-    return (
-      <Box flexDirection="column">
-        {card}
-        {heading('Outcome', parsed?.status !== undefined && parsed.status !== word ? `reported ${parsed.status}` : undefined)}
-        {outcome}
-        {heading('What it did', stepsAside)}
-        {activity}
-        {heading('Brief', kept !== undefined ? `${briefLines.length} ${briefLines.length === 1 ? 'line' : 'lines'}` : undefined)}
-        {brief}
-      </Box>
-    )
-  })
+  // The details pane: the agent whose row was pressed last, in the inspector's tabs.
+  on('ui.render', { component: 'Pane', requestId: DETAILS_PANE }, ($, e) => renderPane($, e))
 
   // A slash command is no prompt for the model: the note waits for one that is.
   on('prompt.submit', async ($, e, next) => {
@@ -933,10 +449,10 @@ export const register: Register = on => {
     const now = await $.clock.now()
     const run: AgentRun = {
       id: result.agentId ?? `${e.tool_use_id}:${now}`,
-      name: e.name ?? (e.workflow !== undefined ? `workflow agent ${e.workflow.agentIndex}` : null),
+      name: e.name !== undefined ? clean(e.name) : e.workflow !== undefined ? `workflow agent ${e.workflow.agentIndex}` : null,
       type: e.subagentType,
       tier: tierOf(result.model),
-      description: e.description,
+      description: clean(e.description),
       status: 'running',
       outcome: null,
       startedAt: now,
@@ -949,8 +465,14 @@ export const register: Register = on => {
     const listed: AgentRun[] = await update($, agents, (list: AgentRun[]) => [...list, run].slice(-KEEP_AGENTS))
     // Details go with their agent when it leaves the list.
     const ids = new Set(listed.map(r => r.id))
+    // Only the newest agents keep each call's input and output.
+    const withIo = new Set(listed.slice(-KEEP_IO_AGENTS).map(r => r.id))
+    const lean = (d: AgentDetails): AgentDetails => ({
+      ...d,
+      ...(d.steps !== undefined ? { steps: d.steps.map(({ input: _input, output: _output, ...step }) => step) } : {}),
+    })
     await update($, details, (all: Record<string, AgentDetails>) => ({
-      ...Object.fromEntries(Object.entries(all).filter(([id]) => ids.has(id))),
+      ...Object.fromEntries(Object.entries(all).filter(([id]) => ids.has(id)).map(([id, d]) => [id, withIo.has(id) ? d : lean(d)])),
       [run.id]: { brief: keep(e.prompt, KEEP_BRIEF_CHARS), report: null },
     }))
     return result
@@ -980,6 +502,37 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
+  // A subagent's model request: what it cost, as the API reported it. The request
+  // is the engine's; the hook only reads the response and returns it.
+  on('turn.step', async function* ($, e, next) {
+    const id = e.agentId
+    const response = yield* next(e)
+    if (id === undefined || !response.usage) return response
+    // The request is answered however this goes: nothing below may call next again.
+    try {
+      const run = ((await read($, agents)) as AgentRun[]).find(r => r.id === id)
+      if (run === undefined) return response
+      const now = await $.clock.now()
+      const usage = response.usage
+      const cacheRead = count(usage.cache_read_input_tokens)
+      await update($, details, (all: Record<string, AgentDetails>) => {
+        const kept = all[id]
+        if (kept === undefined) return all
+        const request: AgentRequest = {
+          at: now - run.startedAt,
+          prompt: count(usage.input_tokens) + cacheRead + count(usage.cache_creation_input_tokens),
+          cacheRead,
+          output: count(usage.output_tokens),
+          steps: kept.steps?.at(-1)?.n ?? 0,
+        }
+        return { ...all, [id]: { ...kept, requests: [...(kept.requests ?? []), request].slice(-KEEP_REQUESTS) } }
+      })
+    } catch {
+      // Not recording a request costs nothing.
+    }
+    return response
+  })
+
   // A subagent's tool call is counted, and marks the agent running again when a
   // follow-up message woke it. A large direct result costs the orchestrator its
   // own context: say how much.
@@ -993,16 +546,18 @@ export const register: Register = on => {
         tools: run.tools + 1,
         lastTool: tool,
       }))
-      const n = await startStep($, id, tool, e as unknown as Record<string, unknown>)
-      if (n === null) return next(e)
+      const begun = await startStep($, id, tool, e as unknown as Record<string, unknown>)
+      if (begun === null) return next(e)
+      const { n, withIo } = begun
       const started = await $.clock.now()
       const result = await next(e)
       const ms = (await $.clock.now()) - started
       const isError = ('deny' in result && result.deny !== undefined) || result.isError === true
+      const output = withIo ? outputOf(result as { deny?: unknown; text?: unknown; result?: unknown }) : undefined
       await update($, details, (all: Record<string, AgentDetails>) => {
         const kept = all[id]
         if (kept?.steps === undefined) return all
-        return { ...all, [id]: { ...kept, steps: kept.steps.map(s => (s.n === n ? { ...s, ms, isError } : s)) } }
+        return { ...all, [id]: { ...kept, steps: kept.steps.map(s => (s.n === n ? { ...s, ms, isError, ...(output !== undefined ? { output } : {}) } : s)) } }
       })
       return result
     }

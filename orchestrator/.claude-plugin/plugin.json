@@ -1,7 +1,7 @@
 {
   "name": "orchestrator",
-  "version": "0.6.1",
-  "description": "Turns a session into an orchestrator that delegates work to Haiku 5.5 and Sonnet 5.5 subagents, keeps its own context small, sizes each task to about 150K tokens of subagent context, and lists the running and past agents in an expandable band whose rows open a details pane with the agent's outcome, steps, tools and brief (/orchestrator on|off|status)",
+  "version": "0.7.0",
+  "description": "Turns a session into an orchestrator that delegates work to Haiku 5.5 and Sonnet 5.5 subagents, keeps its own context small, sizes each task to about 150K tokens of subagent context, and lists the running and past agents in an expandable band whose rows open a tabbed agent inspector: the outcome at a glance, the whole brief in cards, every step with its input and output, and a token view of how the agent's context grew, with charts and animation on desktop (/orchestrator on|off|status)",
   "author": { "name": "Rotem" },
   "types": "./types/index.d.ts"
 }
