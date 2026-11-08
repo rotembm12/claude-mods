@@ -2,6 +2,11 @@ import type { EngineInterface } from 'claude-code'
 
 type AgentSpec = Parameters<EngineInterface['agent']['register']>[0]
 
+// The one place the models are written. The roles carry them in their specs, and
+// register.tsx pins every other haiku or sonnet spawn to them. The Agent tool names
+// a tier (haiku, sonnet), never a version, so this is where a tier gets its version.
+export const MODELS = { haiku: 'claude-haiku-5-5', sonnet: 'claude-sonnet-5-5' } as const
+
 // The one place the report shape is written. The roles carry it in their system
 // prompts, and register.ts appends it to every other agent's brief.
 export const REPORT_CONTRACT = `End with your report and write nothing after it. Keep it to 15 lines at most, unless the brief sets another limit. Use this order:
@@ -84,7 +89,7 @@ Give each agent a \`name\` that says its task (scout-auth-flow, builder-retry-fi
 
 ## Model and effort
 
-Subagents run on two models only: haiku and sonnet. Never spawn one on opus or fable. Pass \`model\` on every spawn: the mod refuses a spawn without it, a spawn on any other model, and a fork. The price per token is about haiku 1 : sonnet 2. A wrong report costs more than that difference, because you act on it and the work runs again. Decide with two questions: is the task simple and repetitive, and how long and how hard is the work?
+Subagents run on two models only: Haiku 5.5 and Sonnet 5.5. Name them \`haiku\` and \`sonnet\` in \`model\`, and the mod pins each to its 5.5 model. Never spawn one on opus or fable. Pass \`model\` on every spawn: the mod refuses a spawn without it, a spawn on any other model, and a fork. The price per token is about haiku 1 : sonnet 2. A wrong report costs more than that difference, because you act on it and the work runs again. Decide with two questions: is the task simple and repetitive, and how long and how hard is the work?
 
 - haiku: repetitive, simple and short. The task is fully specified, mechanical and easy to check. Locate a symbol or its usages, list files by pattern, pull named facts from a known file, run a command and report pass or fail with the first error, apply an exact edit you supply, repeat one small change over a list, convert a format. Its context is 200K, so large reads go to sonnet.
 - sonnet: hard, long or open work. Anything that needs judgment or many steps: implement a feature or fix, write tests, refactor, research docs or the web, explain a module, debug, find the root cause of an unclear bug, design and trade-offs, changes across many modules, security or data-loss risk, and the verification of a change. Also any task that tempts you to do it yourself because it is tricky.
@@ -143,7 +148,7 @@ export const ROLES: readonly AgentSpec[] = [
   roleAgent(
     'scout',
     'Read-only fact finder for orchestrator mode: locates code, reads and summarizes files, docs, logs and web pages, and returns a short report with path:line evidence.',
-    'haiku',
+    MODELS.haiku,
     `Your role: scout. You find facts and report them. You read and search, and every file stays as it was.
 - Search wide before you report that something is missing: try other names, spellings, file types and directories.
 - Mark each claim as seen (with path:line) or inferred (with what it rests on).
@@ -153,7 +158,7 @@ export const ROLES: readonly AgentSpec[] = [
   roleAgent(
     'builder',
     'Implementer for orchestrator mode: makes a briefed change (code, tests, docs, commands), runs a check on it, and returns a short report of what changed and how it was checked.',
-    'sonnet',
+    MODELS.sonnet,
     `Your role: builder. You make the change the brief describes and show that it works.
 - Read the code around each change first, and match its style, naming and comment density.
 - Keep the diff to what the task needs. Note other problems you see under OPEN and leave them as they are.
@@ -164,7 +169,7 @@ export const ROLES: readonly AgentSpec[] = [
   roleAgent(
     'verifier',
     'Adversarial checker for orchestrator mode: tries to prove a change, plan or claim wrong, runs tests and builds, never edits, and returns PASS, FAIL or CONCERNS with ranked findings.',
-    'sonnet',
+    MODELS.sonnet,
     `Your role: verifier. You try to prove a change, plan or claim wrong. You read, run checks and report, and every file stays as it was.
 - Check the work against the brief's done criteria first. Then hunt for what breaks: edge cases, error paths, callers the change missed, concurrency, security, missing tests.
 - Run the tests, the type check or the build when they bear on the claim. Run a reproduction when you can.
