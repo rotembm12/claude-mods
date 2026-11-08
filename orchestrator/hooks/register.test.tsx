@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { AgentSpawnInput, On } from 'claude-code'
+import type { AgentSpawnInput, On, TurnUsage } from 'claude-code'
 
 import { ROLES } from './prompts'
 
@@ -21,7 +21,7 @@ type Setup = { store?: Record<string, unknown>; models?: Record<string, string> 
 function engine(on: On, setup: Setup = {}) {
   const store: Record<string, unknown> = { ...setup.store }
   const clock = mock.clock(on)
-  const seen = { store, clock, prompts: [] as { text: string; context?: readonly string[] }[], spawned: [] as AgentSpawnInput[], roles: [] as string[], commands: [] as string[], opened: [] as { id: string; title?: string }[] }
+  const seen = { requested: 0, details: {} as unknown, usages: [] as (TurnUsage | null)[], store, clock, prompts: [] as { text: string; context?: readonly string[] }[], spawned: [] as AgentSpawnInput[], roles: [] as string[], commands: [] as string[], opened: [] as { id: string; title?: string }[] }
   on('ui.open', (_$, e) => {
     seen.opened.push({ id: e.id, title: e.title })
     return { value: { isPlaced: true } }
@@ -56,7 +56,18 @@ function engine(on: On, setup: Setup = {}) {
     return { model: setup.models?.[e.subagentType] ?? e.model ?? 'claude-opus-5-5', agentId: `agent-${seen.spawned.length}` }
   })
   on('session.cwd', () => ({ value: '/repo' }))
-  on('tool.call', (_$, e) => ({
+  // Keeps the details the plugin writes: the test's `$` cannot read the state back.
+  on('state.set', (_$, e, next) => {
+    if (e.plugin === PLUGIN && e.key === 'details') seen.details = JSON.parse(JSON.stringify(e.value))
+    return next(e)
+  })
+  // A model request answers the next usage the test queued, else a small one.
+  on('turn.step', async function* (_$, e) {
+    seen.requested++
+    const usage = seen.usages.length > 0 ? seen.usages.shift()! : { model: 'claude-haiku-5-5', input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage }
+  })
+  on('tool.call', (_$, e) => (e.tool === 'Bash' && e.command === 'denied' ? { deny: 'Not allowed here.' } : e.tool === 'Bash' && e.command === 'colored' ? { result: {} as never, text: '\u001b[31mred\u001b[0m\f' } : e.tool === 'Bash' && e.command === 'numeric' ? { result: {} as never, text: 42 as never } : {
     result: {} as never,
     text: e.tool === 'Read' ? 'x'.repeat(e.file_path === 'big.ts' ? 12_000 : 200) : 'ok',
     // A command named `false` fails, as the shell's own does.
@@ -473,12 +484,15 @@ test('a press on an agent row opens a pane with its card, outcome, steps and bri
     expect(await pane.find({ type: 'Text', text: ' DONE ' })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: 'Haiku 5.5' })).toBeDefined()
     expect(await pane.find({ type: 'Markdown', text: 'refreshed in `src/auth.ts:42`' })).toBeDefined()
-    expect(await pane.find({ type: 'Markdown', text: 'Goal: find where the auth token is refreshed' })).toBeDefined()
     // The step, relative to the session's folder, and the file it read.
     expect(await pane.find({ type: 'Text', text: 'src/auth.ts' })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: 'file read' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'Files read' })).toBeDefined()
     // The answer sits in its own box, under a small caption.
     expect(await pane.find({ type: 'Text', text: 'Answer' })).toBeDefined()
+    // The brief is on its own tab, in a card.
+    await pane.press({ key: 'orchestrator-tab-brief' })
+    expect(await pane.find({ type: 'Markdown', text: 'find where the auth token is refreshed' })).toBeDefined()
+    await pane.press({ key: 'orchestrator-tab-overview' })
     await pane.unmount()
   }
 
@@ -526,6 +540,11 @@ test('the pane tells the work as phases, marks the failed ones, and splits the r
     expect(await pane.find({ type: 'Text', text: 'file edited' })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: '✎ src/auth.ts' })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: /4 tools · 1 failed/ })).toBeDefined()
+    // The overview says what changed and how much is open; the report tab has every field.
+    expect(await pane.find({ type: 'Markdown', text: 'the refresh now retries once' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '✎ Top changes' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '⚑ 1 open question or risk' })).toBeDefined()
+    await pane.press({ key: 'orchestrator-tab-report' })
     // The report, a field to a block: one written as one line with "; " is a list.
     expect(await pane.find({ type: 'Markdown', text: 'the refresh now retries once' })).toBeDefined()
     expect(await pane.find({ type: 'Markdown', text: '- `src/auth.ts:42` retries  \n- `false` failed' })).toBeDefined()
@@ -534,16 +553,20 @@ test('the pane tells the work as phases, marks the failed ones, and splits the r
     expect(await pane.find({ type: 'Text', text: '✎ Changes' })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: '⌕ Evidence' })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: '⚑ Open questions & risks' })).toBeDefined()
+    await pane.press({ key: 'orchestrator-tab-overview' })
     await pane.unmount()
   }
 })
 
 // The pane for the agent pressed first, its list opened once for every surface.
-async function showAgent($: Engine, id: string, surface: (typeof SURFACES)[number], bodyColumns = 80) {
+async function showAgent($: Engine, id: string, surface: (typeof SURFACES)[number], bodyColumns = 80, tab = 'overview') {
   const band_ = await $.ui.mount({ plugin: PLUGIN, surface, ...band() })
   await band_.press({ key: `orchestrator-agent-${id}` })
   await band_.unmount()
-  return $.ui.mount({ ...detailsPane, props: { ...detailsPane.props, bodyColumns }, surface })
+  const pane = await $.ui.mount({ ...detailsPane, props: { ...detailsPane.props, bodyColumns }, surface })
+  // The open tab outlives a mount: each test starts where it says.
+  await pane.press({ key: `orchestrator-tab-${tab}` })
+  return pane
 }
 const showFirst = ($: Engine, surface: (typeof SURFACES)[number]) => showAgent($, 'agent-1', surface)
 async function openList($: Engine) {
@@ -651,7 +674,7 @@ test('a status written in markdown or with a full stop still reads as the status
     expect(await pane.find({ type: 'Text', text: /reported/ })).toBeUndefined()
     await pane.unmount()
 
-    const dotted = await showAgent($, 'agent-2', surface)
+    const dotted = await showAgent($, 'agent-2', surface, 80, 'report')
     const labels = await dotted.findAll({ type: 'Text', text: /^(⌕ Evidence|⚑ Open questions & risks)$/ })
     expect(labels.map(l => l.text)).toEqual(['⚑ Open questions & risks', '⌕ Evidence'])
     await dotted.unmount()
@@ -694,7 +717,7 @@ test('a call with no target adds no empty detail line', async ($, on) => {
   }
 })
 
-test('only the latest ten phases show until every call is opened', async ($, on) => {
+test('the overview shows the latest ten phases and counts the earlier ones', async ($, on) => {
   engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
   await run($, 'on')
   await spawn($, 'orchestrator:scout', { name: 'scout-long' })
@@ -710,12 +733,10 @@ test('only the latest ten phases show until every call is opened', async ($, on)
     expect(await pane.find({ type: 'Text', text: '②' })).toBeUndefined()
     expect(await pane.find({ type: 'Text', text: '③' })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: '⑫' })).toBeDefined()
-
-    await pane.press({ key: 'orchestrator-steps-toggle' })
-    expect(await pane.find({ type: 'Text', text: /earlier phases/ })).toBeUndefined()
-    expect(await pane.find({ type: 'Text', text: '①' })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: '②' })).toBeDefined()
-    await pane.press({ key: 'orchestrator-steps-toggle' })
+    // Every call is on the Steps tab, which has no more than 40 rows to fold.
+    await pane.press({ key: 'orchestrator-tab-steps' })
+    expect(await pane.find({ key: 'orchestrator-step-1' })).toBeDefined()
+    expect(await pane.find({ key: 'orchestrator-steps-toggle' })).toBeUndefined()
     await pane.unmount()
   }
 })
@@ -736,28 +757,32 @@ test("a verifier's verdict is drawn as a chip", async ($, on) => {
   await pane.unmount()
 })
 
-test('every call and a long brief stay folded until opened whole', async ($, on) => {
+test('the steps tab shows the latest 40 calls until all are asked for, and the brief is never folded', async ($, on) => {
   engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
   await run($, 'on')
-  const brief = Array.from({ length: 12 }, (_, i) => `line ${i + 1}`).join('\n')
+  const brief = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join('\n')
   await spawn($, 'orchestrator:scout', { name: 'scout-many', prompt: brief })
-  for (let i = 1; i <= 10; i++) await $.tool.call({ tool: 'Read' as const, file_path: `/repo/f${i}.ts`, agentId: 'agent-1' })
+  for (let i = 1; i <= 45; i++) await $.tool.call({ tool: 'Read' as const, file_path: `/repo/f${i}.ts`, agentId: 'agent-1' })
   await openList($)
 
   for (const surface of SURFACES) {
-    const pane = await showFirst($, surface)
-    expect((await pane.find({ key: 'orchestrator-steps-toggle' }))?.props.label).toBe('▾ Show every call (10)')
-    expect(await pane.find({ key: 'orchestrator-step-1' })).toBeUndefined()
-    expect(await pane.find({ type: 'Markdown', text: /line 8\s+\n…$/ })).toBeDefined()
+    const pane = await showAgent($, 'agent-1', surface, 80, 'steps')
+    expect((await pane.find({ key: 'orchestrator-steps-toggle' }))?.props.label).toBe('▾ Show all 45 calls')
+    expect(await pane.find({ type: 'Text', text: '⋯ 5 earlier calls' })).toBeDefined()
+    expect(await pane.find({ key: 'orchestrator-step-5' })).toBeUndefined()
+    expect(await pane.find({ key: 'orchestrator-step-6' })).toBeDefined()
+    expect(await pane.find({ key: 'orchestrator-step-45' })).toBeDefined()
 
     await pane.press({ key: 'orchestrator-steps-toggle' })
-    await pane.press({ key: 'orchestrator-brief-toggle' })
-    expect((await pane.find({ key: 'orchestrator-steps-toggle' }))?.props.label).toBe('▴ Hide the calls')
+    expect((await pane.find({ key: 'orchestrator-steps-toggle' }))?.props.label).toBe('▴ Show the latest 40')
     expect(await pane.find({ key: 'orchestrator-step-1' })).toBeDefined()
-    expect(await pane.find({ key: 'orchestrator-step-10' })).toBeDefined()
-    expect(await pane.find({ type: 'Markdown', text: /line 12$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /earlier calls/ })).toBeUndefined()
     await pane.press({ key: 'orchestrator-steps-toggle' })
-    await pane.press({ key: 'orchestrator-brief-toggle' })
+
+    // The brief has no fold: the last line is there at once.
+    await pane.press({ key: 'orchestrator-tab-brief' })
+    expect(await pane.find({ type: 'Markdown', text: /line 30$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Button', text: /Show/ })).toBeUndefined()
     await pane.unmount()
   }
 })
@@ -801,4 +826,423 @@ test('a follow-up answered with no tool call still updates the report and the ti
   expect(await pane.find({ type: 'Markdown', text: 'second answer' })).toBeDefined()
   expect(await pane.find({ type: 'Markdown', text: /first answer/ })).toBeUndefined()
   await pane.unmount()
+})
+
+// One model request of a loop, drained as the engine does, and its response.
+const step = async ($: Engine, agentId?: string) => {
+  const stream = $.turn.step({ turnId: 'turn-1', index: 0, model: 'claude-haiku-5-5', messageCount: 3, ...(agentId !== undefined ? { agentId } : {}) })
+  let next = await stream.next()
+  while (!next.done) next = await stream.next()
+  return next.value
+}
+const usage = (input: number, cacheRead: number, cacheCreation: number, output: number): TurnUsage => ({
+  model: 'claude-haiku-5-5',
+  input_tokens: input,
+  output_tokens: output,
+  cache_read_input_tokens: cacheRead,
+  cache_creation_input_tokens: cacheCreation,
+})
+// The details the mod wrote last, as the engine's state received them.
+const detailsOf = (seen: { details: unknown }) =>
+  seen.details as Record<string, { brief: string; steps?: { n: number; tool: string; input?: string; output?: string }[]; requests?: { at: number; prompt: number; cacheRead: number; output: number; steps: number }[] }>
+
+test('a subagent request is recorded with its prompt, its cache and its output, the main loop and a null usage are not', async ($, on) => {
+  const seen = engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:scout', { name: 'scout-auth' })
+  await spawn($, 'orchestrator:scout', { name: 'scout-two' })
+
+  seen.usages.push(usage(100, 5_000, 2_000, 300))
+  expect((await step($, 'agent-1')).usage?.output_tokens).toBe(300)
+  await seen.clock.advance(4_000)
+  await $.tool.call({ tool: 'Read' as const, file_path: '/repo/a.ts', agentId: 'agent-1' })
+  seen.usages.push(usage(50, 9_000, 0, 120))
+  await step($, 'agent-1')
+  // A response with no usage, the main loop's, and an agent the mod keeps nothing of.
+  seen.usages.push(null)
+  expect((await step($, 'agent-1')).usage).toBeNull()
+  seen.usages.push(usage(1, 1, 1, 1))
+  await step($)
+  seen.usages.push(usage(1, 1, 1, 1))
+  await step($, 'agent-9')
+
+  const all = detailsOf(seen)
+  expect(all['agent-1']?.requests).toEqual([
+    { at: 0, prompt: 7_100, cacheRead: 5_000, output: 300, steps: 0 },
+    { at: 4_000, prompt: 9_050, cacheRead: 9_000, output: 120, steps: 1 },
+  ])
+  expect(all['agent-2']?.requests).toBeUndefined()
+  expect(all['agent-9']).toBeUndefined()
+})
+
+test('a request is sent once, and only the latest 150 are kept', { timeoutMs: 30_000 }, async ($, on) => {
+  const seen = engine(on)
+  await run($, 'on')
+  await spawn($, 'orchestrator:scout')
+  for (let i = 1; i <= 155; i++) {
+    seen.usages.push(usage(i, 0, 0, 1))
+    await step($, 'agent-1')
+  }
+  expect(seen.requested).toBe(155)
+  const requests = detailsOf(seen)['agent-1']?.requests ?? []
+  expect(requests).toHaveLength(150)
+  expect(requests[0]?.prompt).toBe(6)
+  expect(requests.at(-1)?.prompt).toBe(155)
+})
+
+test('a step keeps the call input without the engine keys, clipped, and the output or the deny', async ($, on) => {
+  const seen = engine(on)
+  await run($, 'on')
+  await spawn($, 'orchestrator:builder', { model: 'sonnet' })
+  await $.tool.call({ tool: 'Read' as const, file_path: '/repo/src/auth.ts', offset: 10, limit: 20, agentId: 'agent-1', tool_use_id: 'tu-9' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/repo/a.ts', old_string: 'x'.repeat(2_000), new_string: 'b', agentId: 'agent-1' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'denied', agentId: 'agent-1' } as never)
+  await $.tool.call({ tool: 'Read' as const, file_path: 'big.ts', agentId: 'agent-1' })
+
+  const steps = detailsOf(seen)['agent-1']?.steps ?? []
+  expect(JSON.parse(steps[0]?.input ?? '')).toEqual({ file_path: '/repo/src/auth.ts', offset: 10, limit: 20 })
+  expect(steps[0]?.input).toContain('\n  "offset": 10')
+  expect(steps[0]?.input).not.toMatch(/agentId|tool_use_id|"tool"/)
+  expect(steps[0]?.output).toBe('x'.repeat(200))
+  expect(steps[1]?.input?.length).toBeLessThan(700)
+  expect(steps[1]?.input).toMatch(/… \(\d+ more characters\)$/)
+  expect(steps[1]?.output).toBe('ok')
+  expect(JSON.parse(steps[2]?.input ?? '')).toEqual({ command: 'denied' })
+  expect(steps[2]?.output).toBe('Not allowed here.')
+  expect(steps[3]?.output).toMatch(/^x{600}\n… \(11400 more characters\)$/)
+})
+
+test('only the 15 newest agents keep each call input and output', async ($, on) => {
+  const seen = engine(on)
+  await run($, 'on')
+  for (let i = 1; i <= 16; i++) {
+    await spawn($, 'orchestrator:scout', { prompt: `Goal ${i}` })
+    await $.tool.call({ tool: 'Read' as const, file_path: `/repo/f${i}.ts`, agentId: `agent-${i}` })
+  }
+  // Agent 1 held its IO until the 16th spawned.
+  let all = detailsOf(seen)
+  expect(all['agent-1']?.steps?.[0]?.input).toBeUndefined()
+  expect(all['agent-1']?.steps?.[0]?.output).toBeUndefined()
+  expect(all['agent-1']?.steps?.[0]?.tool).toBe('Read')
+  for (let i = 2; i <= 16; i++) expect(all[`agent-${i}`]?.steps?.[0]?.output).toBe('x'.repeat(200))
+
+  await spawn($, 'orchestrator:scout', { prompt: 'Goal 17' })
+  all = detailsOf(seen)
+  expect(all['agent-2']?.steps?.[0]?.input).toBeUndefined()
+  expect(all['agent-3']?.steps?.[0]?.input).toContain('/repo/f3.ts')
+})
+
+test('a brief and a report of ten thousand characters are kept whole', async ($, on) => {
+  const seen = engine(on)
+  await run($, 'on')
+  const brief = `Goal: ${'b'.repeat(9_994)}`
+  await spawn($, 'orchestrator:scout', { prompt: brief })
+  await finish($, 'agent-1', `STATUS: done\nANSWER: ${'r'.repeat(9_990)}`, 1_000)
+  const kept = detailsOf(seen)['agent-1'] as { brief: string; report: string | null }
+  expect(kept.brief).toBe(brief)
+  expect(kept.report).toBe(`STATUS: done\nANSWER: ${'r'.repeat(9_990)}`)
+})
+
+// ---- The agent inspector: its tabs
+
+// An agent that read, searched, edited and ran a command, four model requests
+// (the last one over the budget), and a report: every tab has something to show.
+async function seedInspector($: Engine, seen: ReturnType<typeof engine>, brief = 'Goal: add a retry\nContext: see src/auth.ts\nTask: edit it\nDone when: tests pass\nReturn: the diff') {
+  await run($, 'on')
+  await spawn($, 'orchestrator:builder', { model: 'sonnet', name: 'builder-inspect', description: 'add the retry', prompt: brief })
+  const call = (input: Record<string, unknown>) => $.tool.call({ ...input, agentId: 'agent-1' } as never)
+  seen.usages.push(usage(20_000, 0, 0, 300))
+  await step($, 'agent-1')
+  await seen.clock.advance(2_000)
+  await call({ tool: 'Read', file_path: '/repo/src/big.ts' })
+  seen.usages.push(usage(10, 40_000, 0, 200))
+  await step($, 'agent-1')
+  await call({ tool: 'Grep', pattern: 'retry', path: '/repo/src' })
+  await call({ tool: 'Bash', command: 'false' })
+  seen.usages.push(usage(10, 45_000, 0, 100))
+  await step($, 'agent-1')
+  await call({ tool: 'Edit', file_path: '/repo/src/auth.ts', old_string: 'a', new_string: 'b' })
+  seen.usages.push(usage(0, 160_000, 0, 400))
+  await step($, 'agent-1')
+  await finish($, 'agent-1', 'STATUS: done\nANSWER: PASS: the retry works\nEVIDENCE: src/auth.ts:42 retries\nCHANGES: src/auth.ts: one retry\nOPEN: the docs', 9_000)
+  await openList($)
+}
+const svgAlts = async (pane: Awaited<ReturnType<typeof showAgent>>) => (await pane.findAll({ type: 'Svg' })).map(s => String(s.props.alt))
+
+test('the tab bar counts what each tab holds, switches on a press, and marks the open one', async ($, on) => {
+  const seen = engine(on)
+  await seedInspector($, seen)
+
+  for (const surface of SURFACES) {
+    const pane = await showFirst($, surface)
+    const labels = async () => Object.fromEntries(await Promise.all(['overview', 'brief', 'steps', 'tokens', 'report'].map(async t => [t, String((await pane.find({ key: `orchestrator-tab-${t}` }))?.props.label).trim()])))
+    expect(await labels()).toEqual({ overview: 'Overview', brief: 'Brief', steps: 'Steps 4', tokens: 'Tokens 160K', report: 'Report ✓' })
+    if (surface === 'desktop') expect((await pane.find({ key: 'orchestrator-tab-overview' }))?.props.variant).toBe('primary')
+    else expect(await pane.find({ type: 'Text', text: ' Overview '})).toBeDefined()
+    expect((await pane.find({ key: 'orchestrator-tab-brief' }))?.props.hotkey).toBe('2')
+
+    await pane.press({ key: 'orchestrator-tab-tokens' })
+    expect(await pane.find({ type: 'Text', text: /^biggest jumps$/i })).toBeDefined()
+    if (surface === 'desktop') {
+      expect((await pane.find({ key: 'orchestrator-tab-tokens' }))?.props.variant).toBe('primary')
+      expect((await pane.find({ key: 'orchestrator-tab-overview' }))?.props.variant).toBe('secondary')
+    } else expect(await pane.find({ type: 'Text', text: ' Tokens 160K ' })).toBeDefined()
+    await pane.press({ key: 'orchestrator-tab-overview' })
+    await pane.unmount()
+  }
+})
+
+test('the overview says who the agent is, the outcome and its numbers, with charts on desktop and text twins on the terminal', async ($, on) => {
+  const seen = engine(on)
+  await seedInspector($, seen)
+
+  for (const surface of SURFACES) {
+    const pane = await showFirst($, surface)
+    expect(await pane.find({ type: 'Text', text: 'builder-inspect' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'add the retry' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: ' DONE ' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: ' PASS ' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'builder' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'Sonnet 5.5' })).toBeDefined()
+    expect(await pane.find({ type: 'Markdown', text: 'the retry works' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '⚑ 1 open question or risk' })).toBeDefined()
+    // Tiles: output tokens, run time, calls, files edited, failed calls.
+    expect(await pane.find({ type: 'Text', text: '1K' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'tokens out' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '4' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'files edited'.replace('files', 'file') })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'failed call' })).toBeDefined()
+    if (surface === 'desktop') {
+      const alts = await svgAlts(pane)
+      expect(alts).toContain('Agent done')
+      expect(alts).toContain('Peak context 160K of 150K, 107%')
+      expect(alts).toContain('Context per request: 4 requests, peak 160K of 150K, now 160K')
+      expect(alts.some(a => /^Timeline of 4 tool calls/.test(a))).toBe(true)
+      for (const svg of await pane.findAll({ type: 'Svg' })) {
+        expect(svg.props.isInteractive).toBe(true)
+        expect(String(svg.props.source).startsWith('<svg')).toBe(true)
+      }
+    } else {
+      expect(await pane.findAll({ type: 'Svg' })).toEqual([])
+      expect(await pane.find({ type: 'Text', text: /^[▁▂▃▄▅▆▇█]+$/ })).toBeDefined()
+      expect(await pane.find({ type: 'Text', text: /^█+░* 107%/ })).toBeDefined()
+    }
+    await pane.unmount()
+  }
+})
+
+test('the brief tab shows the whole brief, a card per section, with its size', async ($, on) => {
+  const seen = engine(on)
+  const brief = `Read this first.\n## Goal\nadd a retry\n**Context:** see src/auth.ts\nTASK: edit it\n${'x'.repeat(5_000)}\nDone When: tests pass\nReturn: the diff\nlast line`
+  await seedInspector($, seen, brief)
+
+  for (const surface of SURFACES) {
+    const pane = await showAgent($, 'agent-1', surface, 80, 'brief')
+    const cards = await pane.findAll({ type: 'Text', text: /^(📄 Intro|🎯 Goal|🧭 Context|🛠 Task|✅ Done when|📦 Return)$/ })
+    expect(cards.map(c => c.text)).toEqual(['📄 Intro', '🎯 Goal', '🧭 Context', '🛠 Task', '✅ Done when', '📦 Return'])
+    expect(await pane.find({ type: 'Markdown', text: 'Read this first.' })).toBeDefined()
+    expect(await pane.find({ type: 'Markdown', text: 'add a retry' })).toBeDefined()
+    expect(await pane.find({ type: 'Markdown', text: 'x'.repeat(5_000) })).toBeDefined()
+    expect(await pane.find({ type: 'Markdown', text: /the diff\s+\nlast line$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: `${brief.length.toLocaleString('en-US')} characters · ≈${Math.round(brief.length / 4000 * 10) / 10}K tokens` })).toBeDefined()
+    await pane.unmount()
+  }
+})
+
+test('a brief with no section is one card, and an agent with no kept brief says so', async ($, on) => {
+  const seen = engine(on)
+  await seedInspector($, seen, 'Just find the retry logic.')
+  for (const surface of SURFACES) {
+    const pane = await showAgent($, 'agent-1', surface, 80, 'brief')
+    expect(await pane.find({ type: 'Text', text: '📄 Brief' })).toBeDefined()
+    expect(await pane.find({ type: 'Markdown', text: 'Just find the retry logic.' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '🎯 Goal' })).toBeUndefined()
+    await pane.unmount()
+  }
+})
+
+test('a step opens to its input and output, closes on a second press, and says when it kept no input', async ($, on) => {
+  const seen = engine(on)
+  await seedInspector($, seen)
+
+  for (const surface of SURFACES) {
+    const pane = await showAgent($, 'agent-1', surface, 80, 'steps')
+    // Every kept call is a row: its mark, its time, its tool and its target.
+    expect((await pane.find({ key: 'orchestrator-step-1' }))?.props.label).toMatch(/^▸ ✓ +0:02 Read +src\/big\.ts$/)
+    expect((await pane.find({ key: 'orchestrator-step-3' }))?.props.label).toMatch(/^▸ ✗ .* Bash +false$/)
+    if (surface === 'desktop') expect((await svgAlts(pane)).some(a => /^Timeline of 4 tool calls/.test(a))).toBe(true)
+    expect(await pane.find({ type: 'Code' })).toBeUndefined()
+
+    await pane.press({ key: 'orchestrator-step-1' })
+    expect((await pane.find({ key: 'orchestrator-step-1' }))?.props.label).toMatch(/^▾ /)
+    const input = await pane.find({ type: 'Code' })
+    expect(input?.props.language).toBe('json')
+    expect(JSON.parse(String(input?.props.source))).toEqual({ file_path: '/repo/src/big.ts' })
+    expect(await pane.find({ type: 'Text', text: 'Input' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'Output' })).toBeDefined()
+    expect(await pane.find({ type: 'Code', text: 'x'.repeat(200) })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '#1 Read' })).toBeDefined()
+
+    // Another press opens that one instead; the failed one marks its output.
+    await pane.press({ key: 'orchestrator-step-3' })
+    expect(await pane.find({ type: 'Text', text: '#1 Read' })).toBeUndefined()
+    expect(await pane.find({ type: 'Text', text: '#3 Bash' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: ' FAILED ' })).toBeDefined()
+    expect(JSON.parse(String((await pane.find({ type: 'Code' }))?.props.source))).toEqual({ command: 'false' })
+    await pane.press({ key: 'orchestrator-step-3' })
+    expect(await pane.find({ type: 'Code' })).toBeUndefined()
+    await pane.unmount()
+  }
+})
+
+test('a step an older agent kept has no input to show, and another agent starts with none open', async ($, on) => {
+  const seen = engine(on)
+  await run($, 'on')
+  // Sixteen agents: the first no longer keeps each call's input and output.
+  for (let i = 1; i <= 16; i++) {
+    await spawn($, 'orchestrator:scout', { name: `scout-${i}`, prompt: `Goal ${i}` })
+    await $.tool.call({ tool: 'Read' as const, file_path: `/repo/f${i}.ts`, agentId: `agent-${i}` })
+  }
+  expect(seen.requested).toBe(0)
+  // The rest finish, so the first is the one running row the list opens with.
+  for (let i = 2; i <= 16; i++) await finish($, `agent-${i}`, '', 1_000)
+  await openList($)
+
+  for (const surface of SURFACES) {
+    const lean = await showAgent($, 'agent-1', surface, 80, 'steps')
+    await lean.press({ key: 'orchestrator-step-1' })
+    expect(await lean.find({ type: 'Text', text: 'Input not kept' })).toBeDefined()
+    expect(await lean.find({ type: 'Text', text: 'Output not kept' })).toBeDefined()
+    await lean.unmount()
+
+    // The step open on one agent is not open on the next.
+    const other = await showAgent($, 'agent-16', surface, 80, 'steps')
+    expect((await other.find({ key: 'orchestrator-step-1' }))?.props.label).toMatch(/^▸ /)
+    expect(await other.find({ type: 'Code' })).toBeUndefined()
+    await other.unmount()
+  }
+})
+
+test('the tokens tab shows how the context grew: the chart, the numbers, the biggest jumps and the requests over budget', async ($, on) => {
+  const seen = engine(on)
+  await seedInspector($, seen)
+
+  for (const surface of SURFACES) {
+    const pane = await showAgent($, 'agent-1', surface, 80, 'tokens')
+    const text = async (t: string | RegExp) => expect(await pane.find({ type: 'Text', text: t })).toBeDefined()
+    await text(/^\s*160K$/)
+    await text('peak context · 107% of 150K')
+    await text('now · 107% of 150K')
+    await text(/^\s*4$/)
+    await text(/^\s*1K$/)
+    await text('output tokens')
+    await text(/^\s*265K$/)
+    await text('prompt tokens processed')
+    await text(/^\s*92%$/)
+    await text('cache hit rate')
+    await text(/^\s*\+46\.7K$/)
+    await text('average growth per request')
+    // The jumps, biggest first, with the calls that came between.
+    const jumps = (await pane.findAll({ type: 'Text', text: /^\+\d+(\.\d)?K$/ })).map(t => t.text).filter(t => t !== '+46.7K')
+    expect(jumps).toEqual(['+115K', '+20K', '+5K'])
+    await text('request #4 → 160K')
+    await text('after Edit src/auth.ts')
+    await text('after Read src/big.ts')
+    await text(/after Grep "retry" in src, Bash false/)
+    await text('Over the 150K budget: request #4')
+    if (surface === 'desktop') expect((await svgAlts(pane)).filter(a => a.startsWith('Context per request'))).toEqual(['Context per request: 4 requests, peak 160K of 150K, now 160K'])
+    else await text(/^[▁▂▃▄▅▆▇█]+$/)
+    await pane.unmount()
+  }
+})
+
+test('an agent with no steps, requests or report says so on every tab, on every surface', async ($, on) => {
+  engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:scout', { name: 'scout-quiet', prompt: 'Goal: wait' })
+  await openList($)
+
+  for (const surface of SURFACES) {
+    const says = async (tab: string, text: string | RegExp, type = 'Text') => {
+      const pane = await showAgent($, 'agent-1', surface, 80, tab)
+      expect(await pane.find({ type, text } as never)).toBeDefined()
+      if (tab === 'overview') {
+        expect(await pane.find({ type: 'Text', text: ' RUNNING ' })).toBeDefined()
+        if (surface === 'desktop') expect(await pane.find({ type: 'Text', text: 'context not recorded' })).toBeDefined()
+      }
+      await pane.unmount()
+    }
+    await says('overview', '● Working')
+    await says('brief', 'wait', 'Markdown')
+    await says('steps', 'No tool calls yet.')
+    await says('tokens', /^No requests recorded/)
+    await says('report', 'No report.'.replace('No report.', '● Working'))
+  }
+})
+
+test('the report tab splits the report, puts open points first when partial, and shows the raw report on a press', async ($, on) => {
+  engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:scout', { name: 'scout-half' })
+  const text = 'STATUS: partial\nANSWER: half of it\nEVIDENCE: a.ts:1\nCHANGES: a.ts: x\nOPEN: the rest'
+  await finish($, 'agent-1', text, 5_000)
+  await openList($)
+
+  for (const surface of SURFACES) {
+    const pane = await showAgent($, 'agent-1', surface, 80, 'report')
+    const order = (await pane.findAll({ type: 'Text', text: /^(✎ Changes|⌕ Evidence|⚑ Open questions & risks)$/ })).map(t => t.text)
+    expect(order).toEqual(['✎ Changes', '⚑ Open questions & risks', '⌕ Evidence'])
+    expect(await pane.find({ type: 'Text', text: 'reported partial' })).toBeUndefined()
+    expect(await pane.find({ type: 'Code' })).toBeUndefined()
+    await pane.press({ key: 'orchestrator-report-raw' })
+    expect(await pane.find({ type: 'Code', text: /^STATUS: partial\nANSWER: half of it/ })).toBeDefined()
+    await pane.press({ key: 'orchestrator-report-raw' })
+    expect(await pane.find({ type: 'Code' })).toBeUndefined()
+    await pane.unmount()
+  }
+})
+
+test('control characters never reach the pane: a step with coloured output opens on both surfaces', async ($, on) => {
+  const seen = engine(on)
+  await run($, 'on')
+  await spawn($, 'orchestrator:builder', { model: 'sonnet', prompt: 'Goal: tidy\u0007 up\u001b[1m' })
+  await $.tool.call({ tool: 'Bash', command: 'colored', agentId: 'agent-1' } as never)
+  const step = detailsOf(seen)['agent-1']?.steps?.[0]
+  expect(step?.output).toBe('red')
+  await openList($)
+
+  for (const surface of SURFACES) {
+    const pane = await showAgent($, 'agent-1', surface, 80, 'steps')
+    // The open step outlives a mount: open it only when it is shut.
+    if (String((await pane.find({ key: 'orchestrator-step-1' }))?.props.label).startsWith('▸')) await pane.press({ key: 'orchestrator-step-1' })
+    expect(await pane.find({ type: 'Code', text: 'red' })).toBeDefined()
+    await pane.unmount()
+  }
+})
+
+test('a result text that is no string is stored as one, a missing usage field counts as none, a path is clipped', async ($, on) => {
+  const seen = engine(on)
+  await run($, 'on')
+  await spawn($, 'orchestrator:scout')
+  await $.tool.call({ tool: 'Bash', command: 'numeric', agentId: 'agent-1' } as never)
+  await $.tool.call({ tool: 'Read' as const, file_path: `/repo/${'d/'.repeat(300)}f.ts`, agentId: 'agent-1' })
+  seen.usages.push({ model: 'claude-haiku-5-5', input_tokens: 10, output_tokens: undefined, cache_read_input_tokens: undefined } as never)
+  await step($, 'agent-1')
+  const kept = detailsOf(seen)['agent-1']
+  expect(kept?.steps?.[0]?.output).toBe('42')
+  expect((kept?.steps?.[1] as { path?: string } | undefined)?.path?.length).toBeLessThanOrEqual(160)
+  expect(kept?.requests).toEqual([{ at: 0, prompt: 10, cacheRead: 0, output: 0, steps: 2 }])
+})
+
+test('an agent outside the 15 newest stores no input or output from the start', async ($, on) => {
+  const seen = engine(on)
+  await run($, 'on')
+  for (let i = 1; i <= 16; i++) await spawn($, 'orchestrator:scout')
+  await $.tool.call({ tool: 'Read' as const, file_path: '/repo/a.ts', agentId: 'agent-1' })
+  await $.tool.call({ tool: 'Read' as const, file_path: '/repo/a.ts', agentId: 'agent-2' })
+  const all = detailsOf(seen)
+  expect(all['agent-1']?.steps?.[0]).toMatchObject({ tool: 'Read', ms: 0 })
+  expect(all['agent-1']?.steps?.[0]?.input).toBeUndefined()
+  expect(all['agent-1']?.steps?.[0]?.output).toBeUndefined()
+  expect(all['agent-2']?.steps?.[0]?.output).toBe('x'.repeat(200))
 })

@@ -1,0 +1,741 @@
+// The agent inspector: the details pane of one agent, in five tabs. A hero says who the
+// agent is and where it stands; the tab bar picks what to read: the outcome at a glance, the
+// whole brief in cards, every step with its input and output, how the context grew, and the
+// report. Desktop draws the charts as animated SVG; the terminal draws their text twins.
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, RenderInput } from 'claude-code'
+
+import type { AgentDetails, AgentRequest, AgentRun, AgentStep, PaneTab } from '../types'
+import {
+  barCells,
+  cleanDetails,
+  clip,
+  clockOf,
+  codeRefs,
+  duration,
+  FILLS,
+  GLYPHS,
+  hardBreaks,
+  itemsOf,
+  labelOf,
+  listify,
+  marker,
+  modelName,
+  parseBrief,
+  parseReport,
+  phaseLabel,
+  phasesOf,
+  stateOf,
+  SWATCHES,
+  timeOf,
+  tokenStats,
+  toolsOf,
+  typeOf,
+} from './format'
+import type { BriefSection, Phase } from './format'
+import { budgetBar, budgetRingSvg, formatTokens, kindOf, ORB_COLORS, PALETTE, sparkline, statusOrbSvg, timelineHeight, timelineSvg, tokenChartSvg } from './visuals'
+import type { OrbState } from './visuals'
+
+// An atom is declared in the module that reads it: these are the keys register.tsx writes.
+const selected = atom({ plugin: 'orchestrator', key: 'selected' } as const, null)
+const agents = atom({ plugin: 'orchestrator', key: 'agents' } as const, [])
+const details = atom({ plugin: 'orchestrator', key: 'details' } as const, {})
+// What only the pane keeps: its open tab, the step opened on the Steps tab, every step
+// shown, and the report as written.
+const tab = atom({ plugin: 'orchestrator', key: 'tab' } as const, 'overview')
+const openStep = atom({ plugin: 'orchestrator', key: 'openStep' } as const, null)
+const showAllSteps = atom({ plugin: 'orchestrator', key: 'showAllSteps' } as const, false)
+const showRawReport = atom({ plugin: 'orchestrator', key: 'showRawReport' } as const, false)
+
+// The context budget a subagent is sized to.
+const BUDGET = 150_000
+// The steps the Steps tab shows until it is asked for all of them.
+const STEP_ROWS = 40
+// The widest bar of the tool mix, in cells, and the detail lines under a phase.
+const BAR_CELLS = 40
+const PHASE_LINES = 3
+// The phases the Overview shows.
+const SHOWN_PHASES = 10
+// A cell of the pane in pixels, about: what an SVG's width is sized from.
+const CELL_PX = 7.4
+// Text on a colored chip: dark, which holds on every mid-tone of the palette.
+const CHIP_TEXT = '#111827'
+
+const ROLE_COLORS: Record<string, string> = { scout: PALETTE.explore, builder: PALETTE.edit, verifier: PALETTE.run }
+const SECTION_COLORS: Record<BriefSection['id'], string> = {
+  intro: PALETTE.muted,
+  goal: PALETTE.other,
+  context: PALETTE.explore,
+  task: PALETTE.run,
+  done: PALETTE.good,
+  return: PALETTE.research,
+  brief: PALETTE.muted,
+}
+const TAB_LABELS: [PaneTab, string][] = [
+  ['overview', 'Overview'],
+  ['brief', 'Brief'],
+  ['steps', 'Steps'],
+  ['tokens', 'Tokens'],
+  ['report', 'Report'],
+]
+
+const kindColor = (tool: string): string => PALETTE[kindOf(tool)]
+const levelColor = (frac: number): string => (frac >= 1 ? PALETTE.bad : frac >= 0.75 ? PALETTE.warn : PALETTE.good)
+const isEdit = (tool: string) => kindOf(tool) === 'edit'
+const percent = (frac: number) => `${Math.round(frac * 100)}%`
+const took = (ms: number) => (ms < 1000 ? `${Math.round(ms)}ms` : duration(ms))
+
+// How an agent stands, as its state word and its run status say.
+function toneOf(word: string, status: AgentRun['status']): string {
+  return ORB_COLORS[word as OrbState] ?? (status === 'running' ? PALETTE.now : status === 'completed' ? PALETTE.good : status === 'failed' ? PALETTE.bad : PALETTE.muted)
+}
+const orbOf = (word: string, status: AgentRun['status']): OrbState =>
+  word in ORB_COLORS ? (word as OrbState) : status === 'running' ? 'running' : status === 'completed' ? 'done' : status === 'failed' ? 'failed' : 'killed'
+
+type Stat = { value: string; what: string; color: string }
+
+export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
+  const ui = $.ui.resolve(e)
+  const { Box, Button, Code, Markdown, Text } = ui
+  const Svg = 'Svg' in ui ? ui.Svg : null
+  const id = await read($, selected)
+  const runs: AgentRun[] = await read($, agents)
+  const run = runs.find(r => r.id === id)
+  if (run === undefined) return <Text dimColor>No agent to show. Open the band's details and click an agent.</Text>
+  // Details an earlier version stored may hold control characters, which the drawing refuses.
+  const stored: AgentDetails | undefined = (await read($, details))[run.id]
+  const kept = stored === undefined ? undefined : cleanDetails(stored)
+  const active: PaneTab = await read($, tab)
+  const opened = await read($, openStep)
+  const isAll = await read($, showAllSteps)
+  const isRaw = await read($, showRawReport)
+
+  const now = await $.clock.now()
+  const isTerminal = e.surface === 'terminal'
+  // A card's border and padding take four columns.
+  const columns = Math.max(16, e.props.bodyColumns)
+  const width = columns - 4
+  const svgWidth = Math.min(960, Math.max(320, Math.round(columns * CELL_PX)))
+  const [glyph] = GLYPHS[run.status]
+  const word = stateOf(run)
+  const tone = toneOf(word, run.status)
+  const isRunning = run.status === 'running'
+  const steps: AgentStep[] = kept?.steps ?? []
+  const requests: AgentRequest[] = kept?.requests ?? []
+  const report = kept?.report ?? null
+  const parsed = report !== null ? parseReport(report) : null
+  const latest = steps.at(-1)
+  const stats = tokenStats(requests, steps, BUDGET)
+  const hasTokens = requests.length > 0
+
+  const edited = [...new Set(steps.filter(s => isEdit(s.tool) && s.path !== undefined).map(s => s.path as string))]
+  const readFiles = [...new Set(steps.filter(s => s.tool === 'Read' && s.path !== undefined).map(s => s.path as string))]
+  const failedCalls = steps.filter(s => s.isError).length
+
+  // ---- Small pieces
+
+  const draw = (source: string, alt: string, size?: number) =>
+    Svg === null ? null : <Svg source={source} alt={alt} isInteractive {...(size !== undefined ? { width: size, height: size } : {})} />
+  const chip = (label: string, color: string) => (
+    <Text backgroundColor={color} color={CHIP_TEXT} bold>
+      {` ${label.toUpperCase()} `}
+    </Text>
+  )
+  const heading = (title: string, accent: string, aside?: string) => (
+    <Box marginTop={isTerminal ? 1 : 2}>
+      <Text color={accent} bold>
+        {'▍'}
+      </Text>
+      <Text bold size="heading">
+        {isTerminal ? title.toUpperCase() : title}
+      </Text>
+      {aside !== undefined && <Text dimColor size="footnote">{`  ${aside}`}</Text>}
+    </Box>
+  )
+  const label = (title: string, color?: string) => (
+    <Box marginTop={1}>
+      <Text bold color={color}>
+        {title}
+      </Text>
+    </Box>
+  )
+  const note = (text: string) => <Text dimColor>{text}</Text>
+  const button = (key: string, text: string, onPress: () => Promise<unknown>) => (
+    <Box marginTop={1}>
+      <Button key={key} {...(isTerminal ? { plain: true as const } : { variant: 'secondary' as const })} label={text} onPress={onPress} />
+    </Box>
+  )
+
+  // ---- The hero: who it is and where it stands
+
+  let room = width
+  const identity: [string, string | undefined, boolean][] = []
+  for (const [text, color, isDim] of [
+    [typeOf(run), ROLE_COLORS[typeOf(run)] ?? PALETTE.other, false],
+    [' · ', undefined, true],
+    [modelName(run.model, run.tier), undefined, false],
+    [` · started ${duration(now - run.startedAt)} ago`, undefined, true],
+  ] as [string, string | undefined, boolean][]) {
+    const shown = clip(text, room)
+    room -= shown.length
+    if (shown !== '') identity.push([shown, color, isDim])
+  }
+  const meta = (
+    <Box>
+      {identity.map(([text, color, isDim], i) => (
+        <Text key={`orchestrator-identity-${i}`} color={color} bold={color !== undefined} dimColor={isDim}>
+          {text}
+        </Text>
+      ))}
+    </Box>
+  )
+
+  const peakFrac = stats.peak / BUDGET
+  const tiles: Stat[] = [
+    ...(hasTokens ? [{ value: formatTokens(stats.totalOutput), what: 'tokens out', color: PALETTE.output }] : []),
+    { value: timeOf(run, now), what: isRunning ? 'so far' : 'run time', color: PALETTE.now },
+    { value: String(run.tools), what: run.tools === 1 ? 'tool call' : 'tool calls', color: PALETTE.explore },
+    ...(edited.length > 0 ? [{ value: String(edited.length), what: edited.length === 1 ? 'file edited' : 'files edited', color: PALETTE.edit }] : []),
+    ...(failedCalls > 0 ? [{ value: String(failedCalls), what: failedCalls === 1 ? 'failed call' : 'failed calls', color: PALETTE.error }] : []),
+  ]
+  const tokensTile = hasTokens ? (
+    <Box key="orchestrator-tile-tokens" flexDirection="column" alignItems="center" borderStyle="round" borderColor={levelColor(peakFrac)} paddingX={1}>
+      {draw(budgetRingSvg(stats.peak, BUDGET, { size: 84, animate: true }), `Peak context ${formatTokens(stats.peak)} of ${formatTokens(BUDGET)}, ${percent(peakFrac)}`, 84)}
+      <Text size="caption" dimColor>
+        peak context
+      </Text>
+    </Box>
+  ) : (
+    <Box key="orchestrator-tile-tokens" flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
+      <Text size="title" bold>
+        —
+      </Text>
+      <Text size="caption" dimColor>
+        context not recorded
+      </Text>
+    </Box>
+  )
+  const statRow = isTerminal ? (
+    <Box flexDirection="column" marginTop={1}>
+      {hasTokens && (
+        <Box>
+          <Text bold color={levelColor(peakFrac)} tabular>
+            {budgetBar(stats.peak, BUDGET, 12)}
+          </Text>
+          <Text dimColor>{`  ${formatTokens(stats.peak)} of ${formatTokens(BUDGET)} peak context`}</Text>
+        </Box>
+      )}
+      <Box flexWrap="wrap">
+        {tiles.map((t, i) => (
+          <Box key={`orchestrator-stat-${t.what}`}>
+            <Text bold tabular color={t.color}>
+              {t.value}
+            </Text>
+            <Text dimColor>{` ${t.what}`}</Text>
+            {i < tiles.length - 1 && <Text dimColor>{'  ·  '}</Text>}
+          </Box>
+        ))}
+      </Box>
+    </Box>
+  ) : (
+    <Box marginTop={1} flexWrap="wrap" gap={1} alignItems="center">
+      {tokensTile}
+      {tiles.map(t => (
+        <Box key={`orchestrator-stat-${t.what}`} flexDirection="column" borderStyle="round" borderColor={t.color} paddingX={1}>
+          <Text size="title" bold tabular>
+            {t.value}
+          </Text>
+          <Text size="caption" dimColor>
+            {t.what}
+          </Text>
+        </Box>
+      ))}
+    </Box>
+  )
+  const hero = (
+    <Box flexDirection="column" borderStyle="round" borderColor={tone} paddingX={1}>
+      <Box gap={1} alignItems="center">
+        {isTerminal ? <Text color={tone} bold>{`${glyph} `}</Text> : draw(statusOrbSvg(orbOf(word, run.status), { size: 44, animate: true }), `Agent ${word}`, 44)}
+        <Box flexDirection="column" flexShrink={1}>
+          <Box justifyContent="space-between" gap={1}>
+            <Box flexShrink={1}>
+              <Text bold size="title">
+                {labelOf(run)}
+              </Text>
+            </Box>
+            {chip(word, tone)}
+          </Box>
+          {run.name !== null && <Text>{run.description}</Text>}
+          {meta}
+        </Box>
+      </Box>
+      {statRow}
+    </Box>
+  )
+
+  // ---- The tab bar
+
+  const countOf = (t: PaneTab): string =>
+    t === 'steps' ? (latest !== undefined ? ` ${latest.n}` : '') : t === 'tokens' ? (hasTokens ? ` ${formatTokens(stats.peak)}` : '') : t === 'report' ? (report !== null ? ' ✓' : '') : ''
+  const tabBar = (
+    <Box marginTop={1} flexWrap="wrap" gap={isTerminal ? 1 : undefined}>
+      {TAB_LABELS.map(([t, name], i) => {
+        const text = `${name}${countOf(t)}`
+        const press = () => update($, tab, () => t)
+        const key = `orchestrator-tab-${t}`
+        return isTerminal ? (
+          <Button key={key} plain hotkey={String(i + 1)} label={` ${text} `} onPress={press}>
+            {t === active ? (
+              <Text inverse bold>
+                {` ${text} `}
+              </Text>
+            ) : (
+              <Text>{` ${text} `}</Text>
+            )}
+          </Button>
+        ) : (
+          <Button key={key} hotkey={String(i + 1)} variant={t === active ? 'primary' : 'secondary'} label={text} onPress={press} />
+        )
+      })}
+    </Box>
+  )
+
+  // ---- The outcome: the report by the contract's fields
+
+  const answerBox = (caption: string, body: JSX.Element | (JSX.Element | false)[]) => (
+    <Box flexDirection="column" borderStyle="round" borderColor={tone} paddingX={1}>
+      <Text dimColor size="caption">
+        {caption}
+      </Text>
+      {body}
+    </Box>
+  )
+  const working = (
+    <Box flexDirection="column">
+      <Text color={PALETTE.now}>● Working</Text>
+      {latest !== undefined && (
+        <Box>
+          <Text dimColor>{'now: '}</Text>
+          <Text color={kindColor(latest.tool)}>{latest.tool}</Text>
+          <Text>{` ${clip(latest.target, width - latest.tool.length - 6)}`}</Text>
+        </Box>
+      )}
+    </Box>
+  )
+  const noReport = report === null ? (isRunning ? working : note(run.status === 'killed' ? 'Stopped before it reported.' : 'No report.')) : null
+  const verdict = /^(PASS|FAIL|CONCERNS)\b[\s:.,-]*/.exec(parsed?.answer ?? '')
+  const verdictTone = verdict?.[1] === 'PASS' ? PALETTE.good : verdict?.[1] === 'FAIL' ? PALETTE.bad : PALETTE.warn
+  const answer = verdict !== null ? (parsed?.answer ?? '').slice(verdict[0].length) : parsed?.answer
+  const hasAnswer = answer !== undefined && answer !== ''
+  const answerView =
+    parsed !== null && (verdict?.[1] !== undefined || hasAnswer)
+      ? answerBox('Answer', [
+          verdict?.[1] !== undefined && (
+            <Box key="orchestrator-verdict" marginBottom={hasAnswer ? 1 : 0}>
+              {chip(verdict[1], verdictTone)}
+            </Box>
+          ),
+          hasAnswer && <Markdown key="orchestrator-answer" text={hardBreaks(codeRefs(answer))} />,
+        ])
+      : null
+  const openItems = parsed?.open !== undefined ? itemsOf(parsed.open).length : 0
+  const changeItems = parsed?.changes !== undefined ? itemsOf(parsed.changes) : []
+  const reported = parsed?.status !== undefined && parsed.status !== word ? `reported ${parsed.status}` : undefined
+
+  const glance = (): JSX.Element => {
+    if (report === null) return noReport as JSX.Element
+    if (parsed === null) return answerBox('Report', <Markdown key="orchestrator-report" text={hardBreaks(report)} />)
+    return (
+      <Box flexDirection="column">
+        {answerView}
+        {changeItems.length > 0 && label('✎ Top changes', PALETTE.edit)}
+        {changeItems.length > 0 && <Markdown key="orchestrator-changes" text={hardBreaks(listify(changeItems.slice(0, 3).join('\n')))} />}
+        {changeItems.length > 3 && note(`+${changeItems.length - 3} more in the Report tab`)}
+        {openItems > 0 && (
+          <Box marginTop={1}>
+            <Text color={PALETTE.warn} bold>{`⚑ ${openItems} open ${openItems === 1 ? 'question or risk' : 'questions & risks'}`}</Text>
+          </Box>
+        )}
+      </Box>
+    )
+  }
+
+  // ---- What it did: phases, the tool mix, files
+
+  const counts: Record<string, number> = {}
+  for (const step of steps) counts[step.tool] = (counts[step.tool] ?? 0) + 1
+  const mix = Object.entries(counts).sort((a, b) => b[1] - a[1])
+  const phases = phasesOf(steps)
+  const earlier = Math.max(0, phases.length - SHOWN_PHASES)
+  const isWorking = isRunning && latest !== undefined && latest.ms === null
+  const lineCells = width - 4
+  const phaseView = (phase: Phase, index: number) => {
+    const first = phase.steps[0] as AgentStep
+    const last = phase.steps.at(-1) as AgentStep
+    const tally: Record<string, number> = {}
+    for (const step of phase.steps) tally[step.tool] = (tally[step.tool] ?? 0) + 1
+    const failed = phase.steps.filter(s => s.isError).length
+    // Up to three detail lines, then how many more there were.
+    const lines: { text: string; mark?: string; markColor?: string }[] =
+      phase.kind === 'edit'
+        ? [...new Set(phase.steps.map(s => s.path ?? s.target).filter(t => t !== ''))].map(path => ({ text: `✎ ${path}` }))
+        : phase.kind === 'run'
+          ? phase.steps.filter(s => s.target !== '').map(s => ({ text: s.target, mark: s.ms === null ? '●' : s.isError ? '✗' : '✓', markColor: s.ms === null ? PALETTE.run : s.isError ? PALETTE.error : undefined }))
+          : [...new Set(phase.steps.map(s => s.target).filter(t => t !== ''))].map(text => ({ text }))
+    const shown = lines.slice(0, PHASE_LINES)
+    const more = lines.length - shown.length
+    const span = `${clockOf(first.at)}–${clockOf(last.ms !== null ? last.at + last.ms : last.at)}`
+    const color = kindColor(first.tool)
+    return (
+      <Box key={`orchestrator-phase-${index}`} flexDirection="column" marginTop={1}>
+        <Box flexWrap="wrap" columnGap={1}>
+          <Text bold color={color}>{marker(index + 1)}</Text>
+          <Text bold color={color}>{clip(phaseLabel(phase), width - 4)}</Text>
+          <Text dimColor>·</Text>
+          <Text dimColor tabular>{span}</Text>
+          <Text dimColor>·</Text>
+          <Text>{Object.entries(tally).map(([tool, n]) => `${tool} ×${n}`).join(' · ')}</Text>
+          {failed > 0 && <Text color={PALETTE.error}>{`${failed} failed`}</Text>}
+          {isWorking && index === phases.length - 1 && <Text color={PALETTE.run}>● in progress</Text>}
+        </Box>
+        {shown.map((line, i) => (
+          <Box key={`orchestrator-phase-${index}-line-${i}`} paddingLeft={3}>
+            {line.mark !== undefined && <Text color={line.markColor} dimColor={line.markColor === undefined}>{`${line.mark} `}</Text>}
+            <Text dimColor={line.markColor !== PALETTE.error} color={line.markColor === PALETTE.error ? PALETTE.error : undefined}>
+              {clip(line.text, lineCells - (line.mark !== undefined ? 2 : 0))}
+            </Text>
+          </Box>
+        ))}
+        {more > 0 && (
+          <Box paddingLeft={3}>
+            <Text dimColor>{`+${more} more`}</Text>
+          </Box>
+        )}
+      </Box>
+    )
+  }
+
+  // One bar for the tool mix: cells in proportion to each tool's calls. Where there
+  // are more tools than cells, the smallest share one "other" segment.
+  const barWidth = Math.min(BAR_CELLS, width)
+  const segments: [string, number][] =
+    mix.length > barWidth ? [...mix.slice(0, barWidth - 1), ['other', mix.slice(barWidth - 1).reduce((sum, [, n]) => sum + n, 0)]] : mix
+  const sizes = barCells(segments.map(([, n]) => n), barWidth)
+  const seenColors: Record<string, number> = {}
+  const fills = segments.map(([tool]) => {
+    const color = kindColor(tool)
+    const turn = seenColors[color] ?? 0
+    seenColors[color] = turn + 1
+    return turn % FILLS.length
+  })
+  const toolMix = (
+    <Box flexDirection="column">
+      <Box>
+        {segments.map(([tool], i) => (
+          <Text key={`orchestrator-bar-${tool}`} mono color={kindColor(tool)}>
+            {(FILLS[fills[i] as number] as string).repeat(sizes[i] as number)}
+          </Text>
+        ))}
+      </Box>
+      <Box marginTop={1} flexWrap="wrap" columnGap={2}>
+        {segments.map(([tool, n], i) => (
+          <Text key={`orchestrator-legend-${tool}`} mono color={kindColor(tool)}>{clip(`${SWATCHES[fills[i] as number]} ${tool} ${n}`, width)}</Text>
+        ))}
+      </Box>
+    </Box>
+  )
+  const noSteps = note(
+    kept?.steps === undefined && run.tools > 0
+      ? 'Steps not kept: this agent started before the mod kept them.'
+      : isRunning
+        ? 'No tool calls yet.'
+        : 'No tool calls: it answered from its brief.',
+  )
+
+  const timeline = (): JSX.Element | null =>
+    steps.length === 0
+      ? null
+      : draw(
+          timelineSvg(steps, { width: svgWidth, height: timelineHeight(steps), totalMs: isRunning ? now - run.startedAt : undefined, isRunning, animate: true }),
+          `Timeline of ${steps.length} tool calls over ${duration(Math.max(run.runMs, (latest?.at ?? 0) + (latest?.ms ?? 0)))}, one lane per kind of tool`,
+        )
+  const contextBars = (compact: boolean): JSX.Element | null => {
+    if (!hasTokens) return null
+    if (!isTerminal)
+      return draw(
+        tokenChartSvg(requests, steps, { width: svgWidth, height: compact ? 190 : 300, budget: BUDGET, isRunning, animate: true }),
+        `Context per request: ${requests.length} requests, peak ${formatTokens(stats.peak)} of ${formatTokens(BUDGET)}, now ${formatTokens(stats.current)}`,
+      )
+    return (
+      <Box flexDirection="column">
+        <Text color={levelColor(peakFrac)} mono>
+          {sparkline(requests.map(r => r.prompt), Math.min(width, 60, Math.max(requests.length, 12)))}
+        </Text>
+        <Text dimColor>{`${budgetBar(stats.peak, BUDGET, 20)} peak ${formatTokens(stats.peak)} of ${formatTokens(BUDGET)}`}</Text>
+      </Box>
+    )
+  }
+
+  const overview = (): JSX.Element => (
+    <Box flexDirection="column">
+      {heading('Outcome', tone, reported)}
+      {glance()}
+      {hasTokens && heading('Context', PALETTE.output, `${requests.length} ${requests.length === 1 ? 'request' : 'requests'}`)}
+      {contextBars(true)}
+      {steps.length > 0 && !isTerminal && heading('Timeline', PALETTE.now, toolsOf(run))}
+      {timeline()}
+      {heading('What it did', PALETTE.explore, `${toolsOf(run)}${failedCalls > 0 ? ` · ${failedCalls} failed` : ''}${isRunning && run.lastTool !== null ? ` · last ${run.lastTool}` : ''}`)}
+      {steps.length === 0 ? (
+        noSteps
+      ) : (
+        <Box flexDirection="column">
+          {earlier > 0 && (
+            <Box marginTop={1}>
+              <Text dimColor>{`⋯ ${earlier} earlier ${earlier === 1 ? 'phase' : 'phases'}`}</Text>
+            </Box>
+          )}
+          {phases.slice(earlier).map((phase, i) => phaseView(phase, earlier + i))}
+          {label('Tool mix')}
+          {toolMix}
+          {edited.length > 0 && label('Files edited', PALETTE.edit)}
+          {edited.map(path => (
+            <Text key={`orchestrator-edited-${path}`} mono>{`✎ ${clip(path, width - 2)}`}</Text>
+          ))}
+          {readFiles.length > 0 && label('Files read', PALETTE.explore)}
+          {readFiles.length > 0 && (
+            <Text dimColor>{clip(readFiles.slice(0, 6).join(', ') + (readFiles.length > 6 ? ` +${readFiles.length - 6} more` : ''), width * 2)}</Text>
+          )}
+        </Box>
+      )}
+    </Box>
+  )
+
+  // ---- Brief: the whole of it, in a card per section
+
+  const briefTab = (): JSX.Element => {
+    if (kept === undefined) return note('Not kept: this agent started before the mod kept briefs.')
+    const sections = parseBrief(kept.brief)
+    const chars = kept.brief.length
+    return (
+      <Box flexDirection="column">
+        {heading('Brief', PALETTE.other, sections.length > 1 ? `${sections.length} sections` : undefined)}
+        <Box flexDirection="column" gap={1} marginTop={1}>
+          {sections.map((s, i) => (
+            <Box key={`orchestrator-brief-${i}`} flexDirection="column" borderStyle="round" borderColor={SECTION_COLORS[s.id]} paddingX={1}>
+              <Text bold color={SECTION_COLORS[s.id]}>{`${s.icon} ${s.title}`}</Text>
+              {s.body !== '' ? <Markdown key={`orchestrator-brief-text-${i}`} text={hardBreaks(s.body)} /> : note('(empty)')}
+            </Box>
+          ))}
+          {sections.length === 0 && note('The brief is empty.')}
+        </Box>
+        <Box marginTop={1}>
+          <Text dimColor>{`${chars.toLocaleString('en-US')} characters · ≈${formatTokens(Math.round(chars / 4))} tokens`}</Text>
+        </Box>
+      </Box>
+    )
+  }
+
+  // ---- Steps: every call, each one opened to its input and output
+
+  const stepsTab = (): JSX.Element => {
+    if (steps.length === 0) return <Box flexDirection="column">{heading('Steps', PALETTE.explore)}{noSteps}</Box>
+    const folded = !isAll && steps.length > STEP_ROWS
+    const shown = folded ? steps.slice(-STEP_ROWS) : steps
+    const dropped = (latest?.n ?? 0) - steps.length
+    const nameCells = Math.min(12, Math.max(4, ...steps.map(s => s.tool.length)))
+    const targetCells = Math.max(8, width - 2 - 2 - 5 - 1 - nameCells - 1 - 8)
+    const detail = (step: AgentStep) => {
+      const color = kindColor(step.tool)
+      return (
+        <Box key={`orchestrator-step-detail-${step.n}`} flexDirection="column" borderStyle="round" borderColor={color} paddingX={1} marginBottom={1}>
+          <Box flexWrap="wrap" columnGap={1}>
+            <Text bold color={color}>{`#${step.n} ${step.tool}`}</Text>
+            {step.ms !== null ? <Text dimColor>{`took ${took(step.ms)}`}</Text> : <Text color={PALETTE.run}>● running</Text>}
+            <Text dimColor>{`at ${clockOf(step.at)}`}</Text>
+            {step.isError && chip('failed', PALETTE.error)}
+          </Box>
+          {label('Input', PALETTE.explore)}
+          {step.input !== undefined && step.input !== '' ? <Code language="json" source={step.input} /> : note('Input not kept')}
+          {label('Output', step.isError ? PALETTE.error : PALETTE.output)}
+          {step.output !== undefined && step.output !== '' ? (
+            <Box borderStyle={step.isError ? 'round' : undefined} borderColor={step.isError ? PALETTE.error : undefined}>
+              <Code source={step.output} />
+            </Box>
+          ) : (
+            note(step.ms === null ? 'Still running…' : 'Output not kept')
+          )}
+        </Box>
+      )
+    }
+    const row = (step: AgentStep) => {
+      const [mark, markColor] = step.ms === null ? ['●', PALETTE.run] : step.isError ? ['✗', PALETTE.error] : ['✓', PALETTE.good]
+      const chevron = opened === step.n ? '▾' : '▸'
+      const target = clip(step.target, targetCells)
+      const tool = clip(step.tool, nameCells).padEnd(nameCells)
+      const time = clockOf(step.at).padStart(5)
+      return (
+        <Box key={`orchestrator-step-row-${step.n}`} flexDirection="column">
+          <Button
+            key={`orchestrator-step-${step.n}`}
+            plain
+            label={`${chevron} ${mark} ${time} ${tool} ${target}`}
+            onPress={() => update($, openStep, (open: number | null) => (open === step.n ? null : step.n))}
+          >
+            <Text dimColor>{`${chevron} `}</Text>
+            <Text color={markColor} bold>{`${mark} `}</Text>
+            <Text dimColor mono tabular>{time}</Text>
+            <Text mono bold color={kindColor(step.tool)}>{` ${tool} `}</Text>
+            <Text color={step.isError ? PALETTE.error : undefined}>{target}</Text>
+            {step.ms !== null && step.ms >= 1000 && <Text dimColor tabular>{` ${duration(step.ms)}`}</Text>}
+          </Button>
+          {opened === step.n && detail(step)}
+        </Box>
+      )
+    }
+    return (
+      <Box flexDirection="column">
+        {heading('Steps', PALETTE.explore, `${toolsOf(run)}${failedCalls > 0 ? ` · ${failedCalls} failed` : ''} · press a call to open its input and output`)}
+        {!isTerminal && <Box marginTop={1}>{timeline()}</Box>}
+        {folded && (
+          <Box marginTop={1}>
+            <Text dimColor>{`⋯ ${steps.length - STEP_ROWS} earlier calls`}</Text>
+          </Box>
+        )}
+        {isAll && dropped > 0 && <Text dimColor>{`The first ${dropped} calls were not kept.`}</Text>}
+        <Box flexDirection="column" marginTop={1}>
+          {shown.map(row)}
+        </Box>
+        {steps.length > STEP_ROWS &&
+          button('orchestrator-steps-toggle', isAll ? `▴ Show the latest ${STEP_ROWS}` : `▾ Show all ${steps.length} calls`, () => update($, showAllSteps, (open: boolean) => !open))}
+      </Box>
+    )
+  }
+
+  // ---- Tokens: how the context grew
+
+  const tokensTab = (): JSX.Element => {
+    if (!hasTokens)
+      return (
+        <Box flexDirection="column">
+          {heading('Tokens', PALETTE.output)}
+          {note(kept?.requests === undefined ? 'No requests recorded: this agent started before the mod kept token usage.' : 'No requests recorded yet.')}
+        </Box>
+      )
+    const currentFrac = stats.current / BUDGET
+    const rows: Stat[] = [
+      { value: formatTokens(stats.peak), what: `peak context · ${percent(peakFrac)} of ${formatTokens(BUDGET)}`, color: levelColor(peakFrac) },
+      { value: formatTokens(stats.current), what: `now · ${percent(currentFrac)} of ${formatTokens(BUDGET)}`, color: levelColor(currentFrac) },
+      { value: String(stats.count), what: stats.count === 1 ? 'request' : 'requests', color: PALETTE.explore },
+      { value: formatTokens(stats.totalOutput), what: 'output tokens', color: PALETTE.output },
+      { value: formatTokens(stats.totalPrompt), what: 'prompt tokens processed', color: PALETTE.research },
+      { value: percent(stats.cacheRate), what: 'cache hit rate', color: PALETTE.good },
+      { value: `${stats.growth >= 0 ? '+' : '-'}${formatTokens(Math.abs(stats.growth))}`, what: 'average growth per request', color: PALETTE.other },
+    ]
+    const callsOf = (calls: AgentStep[]) =>
+      calls.length === 0
+        ? 'no tool calls between'
+        : `after ${calls.slice(0, 2).map(c => `${c.tool}${c.target !== '' ? ` ${c.target}` : ''}`).join(', ')}${calls.length > 2 ? ` +${calls.length - 2} more` : ''}`
+    return (
+      <Box flexDirection="column">
+        {heading('Tokens', PALETTE.output, `${stats.count} ${stats.count === 1 ? 'request' : 'requests'}`)}
+        <Box marginTop={1} flexDirection="column">
+          {contextBars(false)}
+        </Box>
+        {isTerminal ? (
+          <Box flexDirection="column" marginTop={1}>
+            {rows.map(r => (
+              <Box key={`orchestrator-number-${r.what}`}>
+                <Text bold tabular color={r.color}>
+                  {r.value.padStart(7)}
+                </Text>
+                <Text dimColor>{`  ${r.what}`}</Text>
+              </Box>
+            ))}
+          </Box>
+        ) : (
+          <Box marginTop={1} flexWrap="wrap" gap={1}>
+            {rows.map(r => (
+              <Box key={`orchestrator-number-${r.what}`} flexDirection="column" borderStyle="round" borderColor={r.color} paddingX={1}>
+                <Text size="title" bold tabular>
+                  {r.value}
+                </Text>
+                <Text size="caption" dimColor>
+                  {r.what}
+                </Text>
+              </Box>
+            ))}
+          </Box>
+        )}
+        {stats.jumps.length > 0 && heading('Biggest jumps', PALETTE.warn, 'where the context grew most')}
+        {stats.jumps.map(j => (
+          <Box key={`orchestrator-jump-${j.request}`} columnGap={1} flexWrap="wrap">
+            <Text bold color={levelColor(j.prompt / BUDGET)} tabular>{`+${formatTokens(j.delta)}`}</Text>
+            <Text dimColor>{`request #${j.request} → ${formatTokens(j.prompt)}`}</Text>
+            <Text color={j.calls[0] !== undefined ? kindColor(j.calls[0].tool) : undefined}>{clip(callsOf(j.calls), Math.max(20, width - 32))}</Text>
+          </Box>
+        ))}
+        {stats.over.length > 0 && (
+          <Box marginTop={1}>
+            <Text color={PALETTE.bad} bold>
+              {`Over the ${formatTokens(BUDGET)} budget: ${stats.over.length === 1 ? 'request' : 'requests'} ${stats.over.slice(0, 6).map(n => `#${n}`).join(', ')}${stats.over.length > 6 ? ` +${stats.over.length - 6} more` : ''}`}
+            </Text>
+          </Box>
+        )}
+      </Box>
+    )
+  }
+
+  // ---- Report: the fields, then the report as written
+
+  const reportTab = (): JSX.Element => {
+    if (report === null) return <Box flexDirection="column">{heading('Report', tone)}{noReport}</Box>
+    const evidence =
+      parsed?.evidence !== undefined ? (
+        <Box key="orchestrator-evidence-block" flexDirection="column">
+          {label('⌕ Evidence', PALETTE.explore)}
+          <Markdown key="orchestrator-evidence" text={hardBreaks(listify(parsed.evidence))} />
+        </Box>
+      ) : null
+    const open =
+      parsed?.open !== undefined ? (
+        <Box key="orchestrator-open-block" flexDirection="column">
+          {label('⚑ Open questions & risks', PALETTE.warn)}
+          <Markdown key="orchestrator-open" text={hardBreaks(listify(parsed.open))} />
+        </Box>
+      ) : null
+    const openFirst = parsed?.status === 'partial' || parsed?.status === 'blocked'
+    return (
+      <Box flexDirection="column">
+        {heading('Report', tone, reported)}
+        {parsed === null ? (
+          answerBox('Report', <Markdown key="orchestrator-report" text={hardBreaks(report)} />)
+        ) : (
+          <Box flexDirection="column">
+            {answerView}
+            {parsed.changes !== undefined && label('✎ Changes', PALETTE.edit)}
+            {parsed.changes !== undefined && <Markdown key="orchestrator-changes-all" text={hardBreaks(listify(parsed.changes))} />}
+            {openFirst ? open : evidence}
+            {openFirst ? evidence : open}
+            {parsed.notes !== '' && label('Notes')}
+            {parsed.notes !== '' && <Markdown key="orchestrator-notes" dimColor text={hardBreaks(parsed.notes)} />}
+          </Box>
+        )}
+        {parsed !== null && button('orchestrator-report-raw', isRaw ? '▴ Hide the raw report' : `▾ Show the raw report (${report.length.toLocaleString('en-US')} characters)`, () => update($, showRawReport, (open: boolean) => !open))}
+        {parsed !== null && isRaw && (
+          <Box marginTop={1}>
+            <Code source={report} />
+          </Box>
+        )}
+      </Box>
+    )
+  }
+
+  const body = active === 'brief' ? briefTab() : active === 'steps' ? stepsTab() : active === 'tokens' ? tokensTab() : active === 'report' ? reportTab() : overview()
+  return (
+    <Box flexDirection="column">
+      {hero}
+      {tabBar}
+      {body}
+    </Box>
+  )
+}
