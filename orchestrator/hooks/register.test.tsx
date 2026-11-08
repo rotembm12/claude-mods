@@ -152,12 +152,42 @@ test('while on, an Agent call needs a haiku or sonnet model, a fork is refused, 
   expect((await callAgent($, { model: 'sonnet', agentId: 'agent-7' })).deny).toContain('only the orchestrator spawns')
 })
 
-test('the roles run on haiku and sonnet only', () => {
+test('the roles run on haiku 5.5 and sonnet 5.5 only', () => {
   expect(ROLES.map(role => [role.name, role.model])).toEqual([
-    ['scout', 'haiku'],
-    ['builder', 'sonnet'],
-    ['verifier', 'sonnet'],
+    ['scout', 'claude-haiku-5-5'],
+    ['builder', 'claude-sonnet-5-5'],
+    ['verifier', 'claude-sonnet-5-5'],
   ])
+})
+
+test('while on, every haiku or sonnet spawn reaches the engine pinned to its 5.5 model, and while off none is touched', async ($, on) => {
+  const seen = engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
+  await spawn($, 'Explore', { model: 'haiku' })
+  expect(seen.spawned.map(s => s.model)).toEqual(['haiku'])
+
+  await run($, 'on')
+  // The Agent tool names a tier, a script or a teammate may name a version: all land on 5.5.
+  await spawn($, 'Explore', { model: 'haiku' })
+  await spawn($, 'Explore', { model: 'sonnet' })
+  await spawn($, 'general-purpose', { model: 'claude-haiku-4-5-20251001' })
+  await spawn($, 'general-purpose', { model: 'claude-sonnet-4-5' })
+  await spawn($, 'general-purpose', { workflow: { runId: 'wf_1', agentIndex: 1 }, model: 'haiku' })
+  await spawn($, 'general-purpose', { model: 'sonnet', parentAgentId: 'agent-3' })
+  // A role passes no model and keeps the 5.5 model its own spec carries.
+  await spawn($, 'orchestrator:scout')
+
+  expect(seen.spawned.slice(1).map(s => s.model)).toEqual([
+    'claude-haiku-5-5',
+    'claude-sonnet-5-5',
+    'claude-haiku-5-5',
+    'claude-sonnet-5-5',
+    'claude-haiku-5-5',
+    'claude-sonnet-5-5',
+    undefined,
+  ])
+  // The band still counts them by tier, because the tier is read from the pinned id.
+  // A spawn inside a subagent is not tracked, so six of the seven are on the list.
+  expect((await run($, 'status')).text).toBe('Orchestrator mode is on. Agents started while on: 2 sonnet, 4 haiku. 6 still running.')
 })
 
 test('while on, a spawn on opus or fable, a fork, or one with no model is refused, and a role runs on its own', async ($, on) => {

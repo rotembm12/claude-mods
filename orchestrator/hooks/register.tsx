@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { AgentRun, Saved } from '../types'
-import { CONTEXT_BUDGET, ORCHESTRATOR_PROMPT, REPORT_CONTRACT, ROLES } from './prompts'
+import { CONTEXT_BUDGET, MODELS, ORCHESTRATOR_PROMPT, REPORT_CONTRACT, ROLES } from './prompts'
 
 const IS_ON = { plugin: 'orchestrator', key: 'isOn' } as const
 const isOn = atom(IS_ON, false)
@@ -58,6 +58,13 @@ function tierOf(model: string): string {
 }
 
 const isAllowed = (model: string) => ALLOWED_TIERS.includes(tierOf(model))
+
+// An allowed model runs as the pinned model of its tier, whatever name it came with:
+// the tier alone the Agent tool passes, or a version a script or teammate names.
+function pin(model: string): string {
+  const tier = tierOf(model)
+  return tier === 'haiku' || tier === 'sonnet' ? MODELS[tier] : model
+}
 
 function parse(args: string, current: boolean): boolean | 'status' | null {
   const word = args.trim().toLowerCase()
@@ -183,7 +190,7 @@ export const register: Register = on => {
     // The command's own context tells the model, so no press note waits.
     await update($, note, () => null)
     return wanted
-      ? { text: 'Orchestrator mode is on. Claude now delegates the work to haiku and sonnet subagents and keeps its own context small.', context: [ON_NOTE] }
+      ? { text: 'Orchestrator mode is on. Claude now delegates the work to Haiku 5.5 and Sonnet 5.5 subagents and keeps its own context small.', context: [ON_NOTE] }
       : { text: 'Orchestrator mode is off.', context: [OFF_NOTE] }
   })
 
@@ -318,12 +325,14 @@ export const register: Register = on => {
     if (e.fork) return { deny: FORK_DENY }
     const isRole = e.subagentType.startsWith(ROLE_PREFIX)
     if (e.model === undefined ? !isRole : !isAllowed(e.model)) return { deny: SPAWN_DENY }
-    if (e.parentAgentId !== undefined) return next(e)
+    // A role passes no model and runs on the one its own spec carries.
+    const pinned = e.model === undefined ? e : { ...e, model: pin(e.model) }
+    if (e.parentAgentId !== undefined) return next(pinned)
 
     // The roles carry the budget and the contract in their own prompts, and a
     // workflow agent's prompt cannot be rewritten.
     const addsContract = !isRole && e.workflow === undefined && e.isTeammate === undefined
-    const result = await next(addsContract ? { ...e, prompt: `${e.prompt}\n\n${CONTEXT_BUDGET}\n\n${REPORT_CONTRACT}` } : e)
+    const result = await next(addsContract ? { ...pinned, prompt: `${e.prompt}\n\n${CONTEXT_BUDGET}\n\n${REPORT_CONTRACT}` } : pinned)
     if ('deny' in result && result.deny !== undefined) return result
 
     const now = await $.clock.now()
