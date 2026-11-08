@@ -21,7 +21,11 @@ type Setup = { store?: Record<string, unknown>; models?: Record<string, string> 
 function engine(on: On, setup: Setup = {}) {
   const store: Record<string, unknown> = { ...setup.store }
   const clock = mock.clock(on)
-  const seen = { store, clock, prompts: [] as { text: string; context?: readonly string[] }[], spawned: [] as AgentSpawnInput[], roles: [] as string[], commands: [] as string[] }
+  const seen = { store, clock, prompts: [] as { text: string; context?: readonly string[] }[], spawned: [] as AgentSpawnInput[], roles: [] as string[], commands: [] as string[], opened: [] as { id: string; title?: string }[] }
+  on('ui.open', (_$, e) => {
+    seen.opened.push({ id: e.id, title: e.title })
+    return { value: { isPlaced: true } }
+  })
   on('store.get', (_$, e) => ({ value: store[e.key] }))
   on('store.set', (_$, e) => {
     store[e.key] = JSON.parse(JSON.stringify(e.value))
@@ -109,7 +113,10 @@ test('/orchestrator on adds the section and offers the roles, and off takes both
 
   const onResult = await run($, 'on')
   expect(onResult.text).toContain('Orchestrator mode is on')
-  expect(onResult.context?.[0]).toContain('"Orchestrator mode" section')
+  // The note carries the rules whole: a mid-session switch may never reach the system prompt.
+  expect(onResult.context?.[0]).toContain('Its rules follow')
+  expect(onResult.context?.[0]).toContain('# Orchestrator mode')
+  expect(onResult.context?.[0]).toContain('## Model and effort')
   expect(await compose($)).toEqual(['intro', 'orchestrator:mode'])
   expect(await offered($, 'orchestrator:builder')).toBe(true)
 
@@ -135,15 +142,17 @@ test("a teammate's render of the lead's prompt carries no section", async ($, on
   expect(await compose($, ['teammate'])).toEqual(['intro'])
 })
 
-test('while on, an Agent call needs a haiku or sonnet model, a fork is refused, and a subagent cannot spawn', async ($, on) => {
+test('while on, an Agent call needs a haiku or sonnet model unless it is a role, a fork is refused, and a subagent cannot spawn', async ($, on) => {
   engine(on)
   expect('deny' in (await callAgent($, {}))).toBe(false)
   expect('deny' in (await callAgent($, { model: 'opus' }))).toBe(false)
   expect('deny' in (await callAgent($, { subagent_type: 'fork' }))).toBe(false)
 
   await run($, 'on')
-  const missing = await callAgent($, { subagent_type: 'orchestrator:scout' })
+  const missing = await callAgent($, { subagent_type: 'general-purpose' })
   expect(missing.deny).toContain('pass `model` (haiku or sonnet)')
+  // A role left without a model runs on its own: the scout on haiku.
+  expect((await callAgent($, { subagent_type: 'orchestrator:scout' })).deny).toBeUndefined()
   expect((await callAgent($, { subagent_type: 'orchestrator:scout', model: 'haiku' })).deny).toBeUndefined()
   expect((await callAgent($, { subagent_type: 'orchestrator:builder', model: 'sonnet' })).deny).toBeUndefined()
   expect((await callAgent($, { subagent_type: 'orchestrator:verifier', model: 'opus' })).deny).toContain('never opus or fable')
@@ -234,6 +243,13 @@ test('while on, built-in agents get the report contract, roles do not, and the b
   expect((await run($, 'status')).text).toBe('Orchestrator mode is on. Agents started while on: 1 sonnet, 2 haiku. 3 still running.')
 })
 
+const detailsPane = {
+  plugin: PLUGIN,
+  component: 'Pane',
+  requestId: 'orchestrator-agent',
+  props: { title: 'Agent', isFocused: false, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} },
+} as const
+
 const finish = ($: Engine, agentId: string, answer: string, durationMs: number, reason: 'answer' | 'aborted' | 'error' = 'answer') =>
   $.turn.complete({ agentId, answer, durationMs, reason, isAborted: reason === 'aborted', turnId: `turn-${agentId}` })
 
@@ -263,9 +279,9 @@ test('the details button opens a list of the running and the past agents', async
     expect(await ui.find({ type: 'Text', text: /scout-auth/ })).toBeUndefined()
 
     await ui.press({ key: 'orchestrator-details' })
-    expect(await ui.find({ type: 'Text', text: 'builder-retry · builder · sonnet · running · 2m 05s · 2 tools · Edit' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'scout-auth · scout · haiku · partial · 1m 05s · 1 tool' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'list the tests · Explore · haiku · killed · 4s · 0 tools' })).toBeDefined()
+    expect(await ui.find({ type: 'Button', text: 'builder-retry · builder · sonnet · running · 2m 05s · 2 tools · Edit' })).toBeDefined()
+    expect(await ui.find({ type: 'Button', text: 'scout-auth · scout · haiku · partial · 1m 05s · 1 tool' })).toBeDefined()
+    expect(await ui.find({ type: 'Button', text: 'list the tests · Explore · haiku · killed · 4s · 0 tools' })).toBeDefined()
 
     await ui.press({ key: 'orchestrator-details' })
     expect(await ui.find({ type: 'Text', text: /scout-auth/ })).toBeUndefined()
@@ -278,7 +294,7 @@ test('the details button opens a list of the running and the past agents', async
   await seen.clock.advance(5_000)
   const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...band() })
   await ui.press({ key: 'orchestrator-details' })
-  expect(await ui.find({ type: 'Text', text: 'scout-auth · scout · haiku · running · 1m 10s · 2 tools · Read' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: 'scout-auth · scout · haiku · running · 1m 10s · 2 tools · Read' })).toBeDefined()
   await ui.unmount()
 })
 
@@ -290,9 +306,9 @@ test('the open list fits the rows the band has, and says how many more there are
   const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...band(false, 80, 10) })
   await ui.press({ key: 'orchestrator-details' })
   // Nine rows under the switch: eight agents, newest first, and the "more" row.
-  expect(await ui.find({ type: 'Text', text: /^scout-15 ·/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^scout-8 ·/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^scout-7 ·/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', text: /^scout-15 ·/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: /^scout-8 ·/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: /^scout-7 ·/ })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: /7 more/ })).toBeDefined()
   await ui.unmount()
 })
@@ -425,4 +441,69 @@ test('pressing the segment that already holds changes nothing', async ($, on) =>
   expect(seen.prompts[0]?.context).toBeUndefined()
   expect(await compose($)).toEqual(['intro'])
   expect(seen.store.sessions).toBeUndefined()
+})
+
+test('a press on an agent row opens a pane with its model, brief and report', async ($, on) => {
+  const seen = engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:scout', { name: 'scout-auth', description: 'find the auth flow', prompt: 'Goal: find where the auth token is refreshed' })
+  await spawn($, 'orchestrator:builder', { model: 'sonnet', name: 'builder-retry', prompt: 'Goal: add a retry' })
+  await $.tool.call({ tool: 'Read' as const, file_path: 'auth.ts', agentId: 'agent-1' })
+  await finish($, 'agent-1', 'STATUS: done\nANSWER: refreshed in auth.ts:42', 30_000)
+
+  // The list stays open across mounts: open it once.
+  const opener = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...band() })
+  await opener.press({ key: 'orchestrator-details' })
+  await opener.unmount()
+
+  for (const surface of SURFACES) {
+    const band_ = await $.ui.mount({ plugin: PLUGIN, surface, ...band() })
+    await band_.press({ key: 'orchestrator-agent-agent-1' })
+    await band_.unmount()
+    expect(seen.opened.at(-1)).toEqual({ id: 'orchestrator-agent', title: 'Agent · scout-auth' })
+
+    const pane = await $.ui.mount({ ...detailsPane, surface })
+    expect(await pane.find({ type: 'Text', text: 'scout-auth' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'haiku (claude-haiku-5-5)' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'Goal: find where the auth token is refreshed' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /ANSWER: refreshed in auth.ts:42/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /1 tool · last Read/ })).toBeDefined()
+    await pane.unmount()
+  }
+
+  // Another row's press moves the pane to that agent, still working with no report.
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...band() })
+  await ui.press({ key: 'orchestrator-agent-agent-2' })
+  await ui.unmount()
+  const pane = await $.ui.mount({ ...detailsPane, surface: 'terminal' })
+  expect(await pane.find({ type: 'Text', text: 'sonnet (claude-sonnet-5-5)' })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /No report yet/ })).toBeDefined()
+  await pane.unmount()
+})
+
+test('the details pane with no agent pressed says so', async ($, on) => {
+  engine(on)
+  const pane = await $.ui.mount({ ...detailsPane, surface: 'desktop' })
+  expect(await pane.find({ type: 'Text', text: /No agent to show/ })).toBeDefined()
+  await pane.unmount()
+})
+
+test('a follow-up answered with no tool call still updates the report and the time', async ($, on) => {
+  const seen = engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:scout', { name: 'scout-auth' })
+  await finish($, 'agent-1', 'STATUS: partial\nANSWER: first answer', 10_000)
+  // SendMessage wakes it, and it answers straight away: no tool call marks it running.
+  await finish($, 'agent-1', 'STATUS: done\nANSWER: second answer', 5_000)
+  await seen.clock.advance(1_000)
+
+  const band_ = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...band() })
+  await band_.press({ key: 'orchestrator-details' })
+  expect(await band_.find({ type: 'Button', text: 'scout-auth · scout · haiku · done · 15s · 0 tools' })).toBeDefined()
+  await band_.press({ key: 'orchestrator-agent-agent-1' })
+  await band_.unmount()
+  const pane = await $.ui.mount({ ...detailsPane, surface: 'terminal' })
+  expect(await pane.find({ type: 'Text', text: /second answer/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /first answer/ })).toBeUndefined()
+  await pane.unmount()
 })

@@ -17,6 +17,16 @@ export type AgentRun = {
   runMs: number
   tools: number
   lastTool: string | null
+  // The model id it runs on. Optional: runs an earlier version kept have none.
+  model?: string
+}
+
+// What the details pane shows of one agent beyond its run: both clipped.
+export type AgentDetails = {
+  // The brief it was given.
+  brief: string
+  // The last report it gave, or null before its first.
+  report: string | null
 }
 
 declare module 'claude-code' {
@@ -24,6 +34,15 @@ declare module 'claude-code' {
     // `agents` lists the agents the main loop started while the mode was on, newest last.
     // `isExpanded` opens the band's list of them.
     // `note` waits for the next prompt after the band's switch changed the mode.
-    orchestrator: { isOn: boolean; agents: AgentRun[]; isExpanded: boolean; note: string | null }
+    // `selected` is the agent the details pane shows: the row pressed last.
+    // `details` holds each listed agent's brief and report, by agent id.
+    orchestrator: {
+      isOn: boolean
+      agents: AgentRun[]
+      isExpanded: boolean
+      note: string | null
+      selected: string | null
+      details: Record<string, AgentDetails>
+    }
   }
 }
