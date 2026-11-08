@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentDetails, AgentRun, Saved } from '../types'
+import type { AgentDetails, AgentRun, AgentStep, Saved } from '../types'
 import { CONTEXT_BUDGET, MODELS, ORCHESTRATOR_PROMPT, REPORT_CONTRACT, ROLES } from './prompts'
 
 const IS_ON = { plugin: 'orchestrator', key: 'isOn' } as const
@@ -13,6 +13,8 @@ const selected = atom({ plugin: 'orchestrator', key: 'selected' } as const, null
 // The brief and report of each listed agent, apart from `agents`, which every
 // subagent tool call rewrites and the band reads on each redraw.
 const details = atom({ plugin: 'orchestrator', key: 'details' } as const, {})
+const showAllSteps = atom({ plugin: 'orchestrator', key: 'showAllSteps' } as const, false)
+const showFullBrief = atom({ plugin: 'orchestrator', key: 'showFullBrief' } as const, false)
 
 const SECTION_ID = 'orchestrator:mode'
 // The pane that shows one agent: the row pressed last.
@@ -20,6 +22,14 @@ const DETAILS_PANE = 'orchestrator-agent'
 // What a run keeps of its brief and its report, for the details pane.
 const KEEP_BRIEF_CHARS = 3000
 const KEEP_REPORT_CHARS = 3000
+// The steps a run keeps, its latest, and how much of each one's target.
+const KEEP_STEPS = 80
+const KEEP_TARGET_CHARS = 160
+// What the pane shows of the long sections until they are opened whole.
+const SHORT_STEPS = 8
+const SHORT_BRIEF_LINES = 8
+// The widest bar of the tool mix, in cells.
+const BAR_CELLS = 14
 const ROLE_PREFIX = 'orchestrator:'
 const STORE_KEY = 'sessions'
 const KEEP_SESSIONS = 100
@@ -131,6 +141,118 @@ function describe(run: AgentRun, now: number): string {
 
 const keep = (text: string, chars: number) => (text.length <= chars ? text : `${text.slice(0, chars)}\n… (${text.length - chars} more characters)`)
 
+// The kind of work a tool does, by the color its name is drawn in.
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
+const RUN_TOOLS = new Set(['Bash', 'PowerShell'])
+const WEB_TOOLS = new Set(['WebFetch', 'WebSearch'])
+const FIND_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS', 'NotebookRead'])
+function toolColor(tool: string): string {
+  if (EDIT_TOOLS.has(tool)) return 'success'
+  if (RUN_TOOLS.has(tool)) return 'warning'
+  if (WEB_TOOLS.has(tool)) return 'remember'
+  if (FIND_TOOLS.has(tool)) return 'suggestion'
+  return 'claude'
+}
+
+// How each way an agent can stand is colored: its card's border and its chip.
+const TONES: Record<string, string> = {
+  running: 'suggestion',
+  done: 'success',
+  partial: 'warning',
+  blocked: 'warning',
+  failed: 'error',
+  killed: 'inactive',
+}
+
+// The keys a tool call carries that are no argument of the tool's.
+const RESERVED = new Set(['tool', 'tool_use_id', 'agentId', 'consent'])
+const textOf = (value: unknown) => (typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined)
+const firstLine = (text: string) => text.split('\n')[0] ?? ''
+
+function relative(path: string, cwd: string): string {
+  if (cwd !== '' && path.startsWith(`${cwd}/`)) return path.slice(cwd.length + 1)
+  const parts = path.split('/')
+  return path.startsWith('/') && parts.length > 4 ? `…/${parts.slice(-3).join('/')}` : path
+}
+
+// What a call acted on, in a few words, and the file when it names one.
+function targetOf(tool: string, input: Record<string, unknown>, cwd: string): { target: string; path?: string } {
+  const file = textOf(input.file_path) ?? textOf(input.notebook_path)
+  if (file !== undefined) {
+    const path = relative(file, cwd)
+    const offset = typeof input.offset === 'number' ? input.offset : undefined
+    const limit = typeof input.limit === 'number' ? input.limit : undefined
+    const range = offset !== undefined ? `:${offset}${limit !== undefined ? `-${offset + limit}` : ''}` : limit !== undefined ? `:1-${limit}` : ''
+    return { target: `${path}${range}`, path }
+  }
+  const pattern = textOf(input.pattern)
+  if (pattern !== undefined) {
+    const where = textOf(input.path) ?? textOf(input.glob)
+    const shown = tool === 'Grep' ? `"${pattern}"` : pattern
+    return { target: where !== undefined ? `${shown} in ${relative(where, cwd)}` : shown }
+  }
+  const query = textOf(input.query)
+  if (query !== undefined) return { target: `"${firstLine(query)}"` }
+  const named = textOf(input.command) ?? textOf(input.url) ?? textOf(input.description) ?? textOf(input.skill) ?? textOf(input.prompt)
+  if (named !== undefined) return { target: firstLine(named) }
+  const other = Object.entries(input).find(([key, value]) => !RESERVED.has(key) && textOf(value) !== undefined)
+  return { target: other !== undefined ? firstLine(String(other[1]).trim()) : '' }
+}
+
+// A step's start, as minutes and seconds after the agent's.
+function clockOf(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000))
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
+}
+
+// A report split by the contract's fields; null when it follows none of them.
+type Report = { status?: string; answer?: string; evidence?: string; changes?: string; open?: string; notes: string }
+const FIELD = /^\s*(?:[-*>#]+\s*)?\**(STATUS|ANSWER|EVIDENCE|CHANGES|OPEN)\**\s*:\**\s*/
+function parseReport(report: string): Report | null {
+  const fields: Record<string, string[]> = {}
+  const notes: string[] = []
+  let current: string | null = null
+  for (const line of report.split('\n')) {
+    const match = FIELD.exec(line)
+    if (match?.[1] !== undefined) {
+      current = match[1].toLowerCase()
+      fields[current] = [line.slice(match[0].length)]
+    } else if (current !== null) fields[current]?.push(line)
+    else notes.push(line)
+  }
+  if (fields.status === undefined && fields.answer === undefined) return null
+  const field = (name: string) => {
+    const text = fields[name]?.join('\n').trim()
+    return text === undefined || text === '' ? undefined : text
+  }
+  return {
+    status: field('status')?.split(/\s/)[0]?.toLowerCase(),
+    answer: field('answer'),
+    evidence: field('evidence'),
+    changes: field('changes'),
+    open: field('open'),
+    notes: notes.join('\n').trim(),
+  }
+}
+
+// path:line references read as code, where the line has none of its own.
+function codeRefs(line: string): string {
+  if (line.includes('`')) return line
+  return line.replace(/(^|[\s(])((?:[\w.@-]+\/)*[\w.@-]+\.[A-Za-z0-9]+:\d+(?:-\d+)?)(?=[\s),;]|\.(?:\s|$)|$)/g, '$1`$2`')
+}
+
+// One line of a report field, or its lines as a list: one item per line, or per
+// "; " when the agent wrote them on one line.
+function listify(body: string): string {
+  const lines = body.split('\n').map(l => l.trim()).filter(l => l !== '')
+  const items = lines.length === 1 && (lines[0] ?? '').includes('; ') ? (lines[0] ?? '').split(/;\s+/) : lines
+  if (items.length === 1) return codeRefs(items[0] ?? '')
+  return items.map(item => (/^([-*]|\d+[.)])\s/.test(item) ? codeRefs(item) : `- ${codeRefs(item.replace(/^•\s*/, ''))}`)).join('\n')
+}
+
+// Markdown joins a paragraph's lines: keep each line of plain text on its own.
+const hardBreaks = (text: string) => text.replace(/([^\n])\n(?=[^\n])/g, '$1  \n')
+
 // A press on a row: the details pane shows that agent, opened or retitled.
 async function showAgent($: EngineInterface, run: AgentRun) {
   await update($, selected, () => run.id)
@@ -177,6 +299,26 @@ async function changeRun($: EngineInterface, id: string, change: (run: AgentRun,
   if (!runs.some(r => r.id === id)) return
   const now = await $.clock.now()
   await update($, agents, (list: AgentRun[]) => list.map(r => (r.id === id ? change(r, now) : r)))
+}
+
+// Adds a running step to an agent the mod keeps details of, and answers its
+// number, or null for an agent it keeps none of.
+async function startStep($: EngineInterface, id: string, tool: string, input: Record<string, unknown>): Promise<number | null> {
+  const run = ((await read($, agents)) as AgentRun[]).find(r => r.id === id)
+  if (run === undefined || (await read($, details))[id] === undefined) return null
+  const cwd = await $.session.cwd().catch(() => '')
+  const now = await $.clock.now()
+  const { target, path } = targetOf(tool, input, cwd)
+  let n: number | null = null
+  await update($, details, (all: Record<string, AgentDetails>) => {
+    const kept = all[id]
+    if (kept === undefined) return all
+    const steps = kept.steps ?? []
+    n = (steps.at(-1)?.n ?? 0) + 1
+    const step: AgentStep = { n, tool, target: clip(target, KEEP_TARGET_CHARS), ...(path !== undefined ? { path } : {}), at: now - run.startedAt, ms: null, isError: false }
+    return { ...all, [id]: { ...kept, steps: [...steps, step].slice(-KEEP_STEPS) } }
+  })
+  return n
 }
 
 export const register: Register = on => {
@@ -314,43 +456,240 @@ export const register: Register = on => {
     )
   })
 
-  // The details pane: the agent whose row was pressed last, its brief and its report.
+  // The details pane: the agent whose row was pressed last. A card says who it
+  // is and where it stands; then what it achieved, the steps it took, and its brief.
   on('ui.render', { component: 'Pane', requestId: DETAILS_PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Button, Markdown, Text } = $.ui.resolve(e)
     const id = await read($, selected)
     const runs: AgentRun[] = await read($, agents)
     const run = runs.find(r => r.id === id)
     if (run === undefined) return <Text dimColor>No agent to show. Open the band's details and click an agent.</Text>
     const kept: AgentDetails | undefined = (await read($, details))[run.id]
+    const allSteps = await read($, showAllSteps)
+    const fullBrief = await read($, showFullBrief)
 
     const now = await $.clock.now()
-    const [glyph, color] = GLYPHS[run.status]
-    const model = run.model !== undefined && run.model !== run.tier ? `${run.tier} (${run.model})` : run.tier
-    const last = run.lastTool !== null ? ` · last ${run.lastTool}` : ''
-    const fact = (label: string, value: string) => (
-      <Box>
-        <Text dimColor>{label.padEnd(8)}</Text>
-        <Text>{value}</Text>
+    const isTerminal = e.surface === 'terminal'
+    // The card's border and padding take four columns.
+    const width = Math.max(40, e.props.bodyColumns) - 4
+    const [glyph, glyphColor] = GLYPHS[run.status]
+    const word = stateOf(run)
+    const tone = TONES[word] ?? glyphColor
+    const steps = kept?.steps ?? []
+    const report = kept?.report ?? null
+    const parsed = report !== null ? parseReport(report) : null
+
+    const edited = [...new Set(steps.filter(s => EDIT_TOOLS.has(s.tool) && s.path !== undefined).map(s => s.path as string))]
+    const readFiles = [...new Set(steps.filter(s => s.tool === 'Read' && s.path !== undefined).map(s => s.path as string))]
+    const failedCalls = steps.filter(s => s.isError).length
+
+    const chip = (label: string, color: string) => (
+      <Text backgroundColor={color} color="inverseText" bold>
+        {` ${label.toUpperCase()} `}
+      </Text>
+    )
+    const heading = (title: string, aside?: string) => (
+      <Box marginTop={1}>
+        <Text bold size="heading" color={isTerminal ? 'claude' : undefined}>
+          {isTerminal ? `▍${title.toUpperCase()}` : title}
+        </Text>
+        {aside !== undefined && <Text dimColor size="footnote">{`  ${aside}`}</Text>}
       </Box>
     )
+    const label = (title: string, color?: string) => (
+      <Box marginTop={1}>
+        <Text bold color={color}>
+          {title}
+        </Text>
+      </Box>
+    )
+
+    // Who it is and where it stands.
+    const model = run.model !== undefined && run.model !== run.tier ? run.model : null
+    const stats: [string, string][] = [
+      [timeOf(run, now), run.status === 'running' ? 'so far' : 'run time'],
+      [String(run.tools), run.tools === 1 ? 'tool call' : 'tool calls'],
+      ...(readFiles.length > 0 ? [[String(readFiles.length), readFiles.length === 1 ? 'file read' : 'files read'] as [string, string]] : []),
+      ...(edited.length > 0 ? [[String(edited.length), edited.length === 1 ? 'file edited' : 'files edited'] as [string, string]] : []),
+      ...(failedCalls > 0 ? [[String(failedCalls), failedCalls === 1 ? 'failed call' : 'failed calls'] as [string, string]] : []),
+    ]
+    const card = (
+      <Box flexDirection="column" borderStyle="round" borderColor={tone} paddingX={1}>
+        <Box justifyContent="space-between">
+          <Box flexShrink={1}>
+            <Text color={glyphColor}>{`${glyph} `}</Text>
+            <Text bold size="title">
+              {labelOf(run)}
+            </Text>
+          </Box>
+          {chip(word, tone)}
+        </Box>
+        {run.name !== null && <Text>{run.description}</Text>}
+        <Box>
+          <Text color={toolColor(typeOf(run))}>{typeOf(run)}</Text>
+          <Text dimColor>{' · '}</Text>
+          <Text>{run.tier}</Text>
+          {model !== null && <Text dimColor>{` (${model})`}</Text>}
+          <Text dimColor>{` · started ${duration(now - run.startedAt)} ago`}</Text>
+        </Box>
+        <Box marginTop={1} flexWrap="wrap" columnGap={3}>
+          {stats.map(([value, what]) => (
+            <Box key={`orchestrator-stat-${what}`}>
+              <Text bold tabular>
+                {value}
+              </Text>
+              <Text dimColor>{` ${what}`}</Text>
+            </Box>
+          ))}
+        </Box>
+      </Box>
+    )
+
+    // What it achieved: the report, by the contract's fields.
+    const latest = steps.at(-1)
+    let outcome
+    if (report === null) {
+      outcome =
+        run.status === 'running' ? (
+          <Box flexDirection="column">
+            <Text color="suggestion">No report yet: the agent is still working.</Text>
+            {latest !== undefined && (
+              <Box>
+                <Text dimColor>{'Now: '}</Text>
+                <Text color={toolColor(latest.tool)}>{latest.tool}</Text>
+                <Text>{` ${clip(latest.target, width - latest.tool.length - 6)}`}</Text>
+              </Box>
+            )}
+          </Box>
+        ) : (
+          <Text dimColor>{run.status === 'killed' ? 'Stopped before it reported.' : 'No report.'}</Text>
+        )
+    } else if (parsed === null) {
+      outcome = <Markdown key="orchestrator-report" text={hardBreaks(report)} />
+    } else {
+      const verdict = /^(PASS|FAIL|CONCERNS)\b[\s:.,-]*/.exec(parsed.answer ?? '')
+      const verdictTone = verdict?.[1] === 'PASS' ? 'success' : verdict?.[1] === 'FAIL' ? 'error' : 'warning'
+      const answer = verdict !== null ? (parsed.answer ?? '').slice(verdict[0].length) : parsed.answer
+      outcome = (
+        <Box flexDirection="column">
+          {verdict?.[1] !== undefined && <Box marginBottom={1}>{chip(verdict[1], verdictTone)}</Box>}
+          {answer !== undefined && answer !== '' && <Markdown key="orchestrator-answer" text={hardBreaks(codeRefs(answer))} />}
+          {parsed.changes !== undefined && label('✎ Changes', 'success')}
+          {parsed.changes !== undefined && <Markdown key="orchestrator-changes" text={hardBreaks(listify(parsed.changes))} />}
+          {parsed.evidence !== undefined && label('⌕ Evidence', 'suggestion')}
+          {parsed.evidence !== undefined && <Markdown key="orchestrator-evidence" text={hardBreaks(listify(parsed.evidence))} />}
+          {parsed.open !== undefined && label('⚑ Open', 'warning')}
+          {parsed.open !== undefined && <Markdown key="orchestrator-open" text={hardBreaks(listify(parsed.open))} />}
+          {parsed.notes !== '' && label('Notes')}
+          {parsed.notes !== '' && <Markdown key="orchestrator-notes" dimColor text={hardBreaks(parsed.notes)} />}
+        </Box>
+      )
+    }
+
+    // The steps it took: which tools, which files, and each call in order.
+    const counts: Record<string, number> = {}
+    for (const step of steps) counts[step.tool] = (counts[step.tool] ?? 0) + 1
+    const mix = Object.entries(counts).sort((a, b) => b[1] - a[1])
+    const most = mix[0]?.[1] ?? 1
+    const nameCells = Math.min(12, Math.max(4, ...steps.map(s => s.tool.length)))
+    const dropped = (latest?.n ?? 0) - steps.length
+    const shownSteps = allSteps ? steps : steps.slice(-SHORT_STEPS)
+    const hidden = steps.length - shownSteps.length
+    const targetCells = width - 2 - 6 - nameCells - 1 - 6
+    const stepRow = (step: AgentStep) => {
+      const [mark, markColor] = step.ms === null ? ['●', 'warning'] : step.isError ? ['✗', 'error'] : ['✓', 'success']
+      return (
+        <Box key={`orchestrator-step-${step.n}`}>
+          <Text color={markColor} dimColor={markColor === 'success'}>{`${mark} `}</Text>
+          <Text dimColor mono tabular>
+            {clockOf(step.at).padStart(5)}
+          </Text>
+          <Text mono color={toolColor(step.tool)}>{` ${clip(step.tool, nameCells).padEnd(nameCells)} `}</Text>
+          <Box flexGrow={1} flexShrink={1}>
+            <Text color={step.isError ? 'error' : undefined}>{clip(step.target, targetCells)}</Text>
+          </Box>
+          {step.ms !== null && step.ms >= 1000 && <Text dimColor tabular>{` ${duration(step.ms)}`}</Text>}
+        </Box>
+      )
+    }
+    const activity =
+      steps.length === 0 ? (
+        <Text dimColor>
+          {kept?.steps === undefined && run.tools > 0
+            ? 'Steps not kept: this agent started before the mod kept them.'
+            : run.status === 'running'
+              ? 'No tool calls yet.'
+              : 'No tool calls: it answered from its brief.'}
+        </Text>
+      ) : (
+        <Box flexDirection="column">
+          {mix.map(([tool, n]) => (
+            <Box key={`orchestrator-mix-${tool}`}>
+              <Text mono color={toolColor(tool)}>{`${clip(tool, nameCells).padEnd(nameCells)} `}</Text>
+              <Text mono color={toolColor(tool)}>
+                {'█'.repeat(Math.max(1, Math.round((n / most) * BAR_CELLS)))}
+              </Text>
+              <Text dimColor tabular>{` ${n}`}</Text>
+            </Box>
+          ))}
+          {edited.length > 0 && label('Files edited', 'success')}
+          {edited.map(path => (
+            <Text key={`orchestrator-edited-${path}`} mono>{`✎ ${clip(path, width - 2)}`}</Text>
+          ))}
+          {readFiles.length > 0 && label('Files read', 'suggestion')}
+          {readFiles.length > 0 && (
+            <Text dimColor>{clip(readFiles.slice(0, 6).join(', ') + (readFiles.length > 6 ? ` +${readFiles.length - 6} more` : ''), width * 2)}</Text>
+          )}
+          {label('Steps')}
+          {dropped > 0 && <Text dimColor>{`  The first ${dropped} calls were not kept.`}</Text>}
+          {hidden > 0 && <Text dimColor>{`  ⋯ ${hidden} earlier ${hidden === 1 ? 'step' : 'steps'}`}</Text>}
+          {shownSteps.map(stepRow)}
+          {steps.length > SHORT_STEPS && (
+            <Box marginTop={1}>
+              <Button
+                key="orchestrator-steps-toggle"
+                {...(isTerminal ? { plain: true as const } : { variant: "secondary" as const })}
+                label={allSteps ? '▴ Show the latest only' : `▾ Show all ${steps.length} steps`}
+                onPress={() => update($, showAllSteps, (open: boolean) => !open)}
+              />
+            </Box>
+          )}
+        </Box>
+      )
+
+    // The brief it was given.
+    const briefLines = kept?.brief.split('\n') ?? []
+    const isLong = briefLines.length > SHORT_BRIEF_LINES
+    const briefText = isLong && !fullBrief ? `${briefLines.slice(0, SHORT_BRIEF_LINES).join('\n')}\n…` : (kept?.brief ?? '')
+    const brief =
+      kept === undefined ? (
+        <Text dimColor>Not kept: this agent started before the mod kept briefs.</Text>
+      ) : (
+        <Box flexDirection="column">
+          <Markdown key="orchestrator-brief" text={hardBreaks(briefText)} />
+          {isLong && (
+            <Box marginTop={1}>
+              <Button
+                key="orchestrator-brief-toggle"
+                {...(isTerminal ? { plain: true as const } : { variant: "secondary" as const })}
+                label={fullBrief ? '▴ Show less' : `▾ Show the full brief (${briefLines.length} lines)`}
+                onPress={() => update($, showFullBrief, (open: boolean) => !open)}
+              />
+            </Box>
+          )}
+        </Box>
+      )
+
+    const stepsAside = `${toolsOf(run)}${failedCalls > 0 ? ` · ${failedCalls} failed` : ''}${run.status === 'running' && run.lastTool !== null ? ` · last ${run.lastTool}` : ''}`
     return (
       <Box flexDirection="column">
-        <Box>
-          <Text color={color}>{glyph} </Text>
-          <Text bold>{labelOf(run)}</Text>
-        </Box>
-        {fact('type', typeOf(run))}
-        {fact('model', model)}
-        {fact('state', stateOf(run))}
-        {fact('time', `${timeOf(run, now)} · started ${duration(now - run.startedAt)} ago`)}
-        {fact('tools', `${toolsOf(run)}${last}`)}
-        {fact('task', run.description)}
-        <Text> </Text>
-        <Text bold>Brief</Text>
-        <Text dimColor={kept === undefined}>{kept?.brief ?? 'Not kept: this agent started before the mod kept briefs.'}</Text>
-        <Text> </Text>
-        <Text bold>Report</Text>
-        <Text dimColor={!kept?.report}>{kept?.report ?? (run.status === 'running' ? 'No report yet: the agent is still working.' : 'No report.')}</Text>
+        {card}
+        {heading('Outcome', parsed?.status !== undefined && parsed.status !== word ? `reported ${parsed.status}` : undefined)}
+        {outcome}
+        {heading('Activity', stepsAside)}
+        {activity}
+        {heading('Brief', kept !== undefined ? `${briefLines.length} ${briefLines.length === 1 ? 'line' : 'lines'}` : undefined)}
+        {brief}
       </Box>
     )
   })
@@ -460,13 +799,25 @@ export const register: Register = on => {
   on('tool.call', async ($, e, next) => {
     if (e.agentId !== undefined) {
       const tool = String(e.tool)
-      await changeRun($, e.agentId, (run, now) => ({
+      const id = e.agentId
+      await changeRun($, id, (run, now) => ({
         ...run,
         ...(run.status === 'running' ? {} : { status: 'running' as const, outcome: null, since: now }),
         tools: run.tools + 1,
         lastTool: tool,
       }))
-      return next(e)
+      const n = await startStep($, id, tool, e as unknown as Record<string, unknown>)
+      if (n === null) return next(e)
+      const started = await $.clock.now()
+      const result = await next(e)
+      const ms = (await $.clock.now()) - started
+      const isError = ('deny' in result && result.deny !== undefined) || result.isError === true
+      await update($, details, (all: Record<string, AgentDetails>) => {
+        const kept = all[id]
+        if (kept?.steps === undefined) return all
+        return { ...all, [id]: { ...kept, steps: kept.steps.map(s => (s.n === n ? { ...s, ms, isError } : s)) } }
+      })
+      return result
     }
     if (!READ_TOOLS.has(String(e.tool)) || !(await read($, isOn))) return next(e)
     const result = await next(e)
