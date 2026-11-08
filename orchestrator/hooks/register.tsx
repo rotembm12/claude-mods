@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRun, Saved } from '../types'
+import type { AgentDetails, AgentRun, Saved } from '../types'
 import { CONTEXT_BUDGET, MODELS, ORCHESTRATOR_PROMPT, REPORT_CONTRACT, ROLES } from './prompts'
 
 const IS_ON = { plugin: 'orchestrator', key: 'isOn' } as const
@@ -9,8 +9,17 @@ const isOn = atom(IS_ON, false)
 const agents = atom({ plugin: 'orchestrator', key: 'agents' } as const, [])
 const isExpanded = atom({ plugin: 'orchestrator', key: 'isExpanded' } as const, false)
 const note = atom({ plugin: 'orchestrator', key: 'note' } as const, null)
+const selected = atom({ plugin: 'orchestrator', key: 'selected' } as const, null)
+// The brief and report of each listed agent, apart from `agents`, which every
+// subagent tool call rewrites and the band reads on each redraw.
+const details = atom({ plugin: 'orchestrator', key: 'details' } as const, {})
 
 const SECTION_ID = 'orchestrator:mode'
+// The pane that shows one agent: the row pressed last.
+const DETAILS_PANE = 'orchestrator-agent'
+// What a run keeps of its brief and its report, for the details pane.
+const KEEP_BRIEF_CHARS = 3000
+const KEEP_REPORT_CHARS = 3000
 const ROLE_PREFIX = 'orchestrator:'
 const STORE_KEY = 'sessions'
 const KEEP_SESSIONS = 100
@@ -36,12 +45,15 @@ const BIG_RESULT_CHARS = 8000
 const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch', 'WebSearch'])
 
 const USAGE = 'Usage: /orchestrator [on|off|status]. With no argument it switches the mode.'
-const ON_NOTE =
-  'Orchestrator mode is now on for this session. From your next request, your system prompt carries the "Orchestrator mode" section. Follow it.'
+// A system prompt can be composed once per thread, so a mode switched on mid-session
+// may never reach it: the note carries the rules whole.
+const ON_NOTE = `Orchestrator mode is now on for this session. Its rules follow. Follow them from this request on. An "Orchestrator mode" section in your system prompt, if there is one, is the same text.
+
+${ORCHESTRATOR_PROMPT}`
 const OFF_NOTE =
-  'Orchestrator mode is now off. The "Orchestrator mode" section left your system prompt, so its delegation, model and report rules no longer apply. Work directly again.'
+  'Orchestrator mode is now off. Its rules (the ones the note that turned it on carried, and any "Orchestrator mode" section in your system prompt) no longer apply: their delegation, model and report rules are gone. Work directly again.'
 const MODEL_DENY =
-  'Orchestrator mode: pass `model` (haiku or sonnet) on this Agent call. Pick it with the "Model and effort" rules in your system prompt, then call again.'
+  'Orchestrator mode: pass `model` (haiku or sonnet) on this Agent call, or use an orchestrator role, which runs on its own model. Pick it with the "Model and effort" rules in your system prompt, then call again.'
 const TIER_DENY =
   'Orchestrator mode: subagents run on haiku or sonnet only, never opus or fable. Use haiku for repetitive, simple tasks and sonnet for hard or long ones, then call again.'
 const FORK_DENY =
@@ -104,16 +116,25 @@ const GLYPHS: Record<AgentRun['status'], [string, string]> = {
   killed: ['■', 'inactive'],
 }
 
+const labelOf = (run: AgentRun) => run.name ?? run.description
+const typeOf = (run: AgentRun) => (run.type.startsWith(ROLE_PREFIX) ? run.type.slice(ROLE_PREFIX.length) : run.type)
+const stateOf = (run: AgentRun) =>
+  run.status === 'running' ? 'running' : run.status === 'completed' ? (run.outcome ?? 'done') : run.status
+const timeOf = (run: AgentRun, now: number) => duration(run.runMs + (run.status === 'running' ? now - run.since : 0))
+const toolsOf = (run: AgentRun) => `${run.tools} ${run.tools === 1 ? 'tool' : 'tools'}`
+
 // One line of the open list: who it is, its model, where it stands, how long, and what it did.
 function describe(run: AgentRun, now: number): string {
-  const label = run.name ?? run.description
-  const type = run.type.startsWith(ROLE_PREFIX) ? run.type.slice(ROLE_PREFIX.length) : run.type
-  const isRunning = run.status === 'running'
-  const state = isRunning ? 'running' : run.status === 'completed' ? (run.outcome ?? 'done') : run.status
-  const time = duration(run.runMs + (isRunning ? now - run.since : 0))
-  const tools = `${run.tools} ${run.tools === 1 ? 'tool' : 'tools'}`
-  const last = isRunning && run.lastTool !== null ? ` · ${run.lastTool}` : ''
-  return `${label} · ${type} · ${run.tier} · ${state} · ${time} · ${tools}${last}`
+  const last = run.status === 'running' && run.lastTool !== null ? ` · ${run.lastTool}` : ''
+  return `${labelOf(run)} · ${typeOf(run)} · ${run.tier} · ${stateOf(run)} · ${timeOf(run, now)} · ${toolsOf(run)}${last}`
+}
+
+const keep = (text: string, chars: number) => (text.length <= chars ? text : `${text.slice(0, chars)}\n… (${text.length - chars} more characters)`)
+
+// A press on a row: the details pane shows that agent, opened or retitled.
+async function showAgent($: EngineInterface, run: AgentRun) {
+  await update($, selected, () => run.id)
+  await $.ui.open({ id: DETAILS_PANE, title: `Agent · ${clip(labelOf(run), 40)}` })
 }
 
 // Running agents first, then the past ones, newest first.
@@ -268,9 +289,15 @@ export const register: Register = on => {
           {shown.map(run => {
             const [glyph, color] = GLYPHS[run.status]
             return (
-              <Box key={`orchestrator-agent-${run.id}`}>
+              <Box key={`orchestrator-row-${run.id}`}>
                 <Text color={color}>  {glyph} </Text>
-                <Text dimColor={run.status !== 'running'}>{clip(describe(run, now), width)}</Text>
+                <Button
+                  key={`orchestrator-agent-${run.id}`}
+                  plain
+                  dimColor={run.status !== 'running'}
+                  label={clip(describe(run, now), width)}
+                  onPress={() => showAgent($, run)}
+                />
               </Box>
             )
           })}
@@ -283,6 +310,47 @@ export const register: Register = on => {
       <Box flexDirection="column">
         {band}
         {below}
+      </Box>
+    )
+  })
+
+  // The details pane: the agent whose row was pressed last, its brief and its report.
+  on('ui.render', { component: 'Pane', requestId: DETAILS_PANE }, async ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    const id = await read($, selected)
+    const runs: AgentRun[] = await read($, agents)
+    const run = runs.find(r => r.id === id)
+    if (run === undefined) return <Text dimColor>No agent to show. Open the band's details and click an agent.</Text>
+    const kept: AgentDetails | undefined = (await read($, details))[run.id]
+
+    const now = await $.clock.now()
+    const [glyph, color] = GLYPHS[run.status]
+    const model = run.model !== undefined && run.model !== run.tier ? `${run.tier} (${run.model})` : run.tier
+    const last = run.lastTool !== null ? ` · last ${run.lastTool}` : ''
+    const fact = (label: string, value: string) => (
+      <Box>
+        <Text dimColor>{label.padEnd(8)}</Text>
+        <Text>{value}</Text>
+      </Box>
+    )
+    return (
+      <Box flexDirection="column">
+        <Box>
+          <Text color={color}>{glyph} </Text>
+          <Text bold>{labelOf(run)}</Text>
+        </Box>
+        {fact('type', typeOf(run))}
+        {fact('model', model)}
+        {fact('state', stateOf(run))}
+        {fact('time', `${timeOf(run, now)} · started ${duration(now - run.startedAt)} ago`)}
+        {fact('tools', `${toolsOf(run)}${last}`)}
+        {fact('task', run.description)}
+        <Text> </Text>
+        <Text bold>Brief</Text>
+        <Text dimColor={kept === undefined}>{kept?.brief ?? 'Not kept: this agent started before the mod kept briefs.'}</Text>
+        <Text> </Text>
+        <Text bold>Report</Text>
+        <Text dimColor={!kept?.report}>{kept?.report ?? (run.status === 'running' ? 'No report yet: the agent is still working.' : 'No report.')}</Text>
       </Box>
     )
   })
@@ -313,7 +381,8 @@ export const register: Register = on => {
     if (!(await read($, isOn))) return next(e)
     if (e.agentId !== undefined) return { deny: DEPTH_DENY }
     if (e.subagent_type === 'fork') return { deny: FORK_DENY }
-    if (!e.model) return { deny: MODEL_DENY }
+    // A role left without a model runs on the one its own spec carries.
+    if (!e.model) return e.subagent_type?.startsWith(ROLE_PREFIX) ? next(e) : { deny: MODEL_DENY }
     if (!isAllowed(e.model)) return { deny: TIER_DENY }
     return next(e)
   }).catch(($, e, next) => (next.called ? next(e) : { deny: CHECK_DENY }))
@@ -349,8 +418,15 @@ export const register: Register = on => {
       runMs: 0,
       tools: 0,
       lastTool: null,
+      model: result.model,
     }
-    await update($, agents, (list: AgentRun[]) => [...list, run].slice(-KEEP_AGENTS))
+    const listed: AgentRun[] = await update($, agents, (list: AgentRun[]) => [...list, run].slice(-KEEP_AGENTS))
+    // Details go with their agent when it leaves the list.
+    const ids = new Set(listed.map(r => r.id))
+    await update($, details, (all: Record<string, AgentDetails>) => ({
+      ...Object.fromEntries(Object.entries(all).filter(([id]) => ids.has(id))),
+      [run.id]: { brief: keep(e.prompt, KEEP_BRIEF_CHARS), report: null },
+    }))
     return result
   }).catch(($, e, next) => (next.called ? next(e) : { deny: CHECK_DENY }))
 
@@ -360,8 +436,20 @@ export const register: Register = on => {
       const status = e.reason === 'answer' ? 'completed' : e.reason === 'aborted' ? 'killed' : 'failed'
       const outcome = /^STATUS:\s*([a-z]+)/im.exec(e.answer)?.[1]?.toLowerCase() ?? null
       await changeRun($, e.agentId, run =>
-        run.status === 'running' ? { ...run, status, outcome, runMs: run.runMs + e.durationMs } : run,
+        run.status === 'running'
+          ? { ...run, status, outcome, runMs: run.runMs + e.durationMs }
+          : // A follow-up answered with no tool call never marked the agent running again.
+            run.status === 'completed' && e.reason === 'answer'
+            ? { ...run, outcome: outcome ?? run.outcome, runMs: run.runMs + e.durationMs }
+            : run,
       )
+      const report = e.answer.trim()
+      const id = e.agentId
+      if (report !== '') {
+        await update($, details, (all: Record<string, AgentDetails>) =>
+          all[id] === undefined ? all : { ...all, [id]: { ...all[id], report: keep(report, KEEP_REPORT_CHARS) } },
+        )
+      }
     }
     return next(e)
   }).catch(($, e, next) => next(e))
