@@ -55,7 +55,13 @@ function engine(on: On, setup: Setup = {}) {
     seen.spawned.push(e)
     return { model: setup.models?.[e.subagentType] ?? e.model ?? 'claude-opus-5-5', agentId: `agent-${seen.spawned.length}` }
   })
-  on('tool.call', (_$, e) => ({ result: {} as never, text: e.tool === 'Read' ? 'x'.repeat(e.file_path === 'big.ts' ? 12_000 : 200) : 'ok' }))
+  on('session.cwd', () => ({ value: '/repo' }))
+  on('tool.call', (_$, e) => ({
+    result: {} as never,
+    text: e.tool === 'Read' ? 'x'.repeat(e.file_path === 'big.ts' ? 12_000 : 200) : 'ok',
+    // A command named `false` fails, as the shell's own does.
+    ...(e.tool === 'Bash' && e.command === 'false' ? { isError: true as const } : {}),
+  }))
   on('turn.complete', (_$, e) => ({ text: e.answer }))
   return seen
 }
@@ -443,13 +449,13 @@ test('pressing the segment that already holds changes nothing', async ($, on) =>
   expect(seen.store.sessions).toBeUndefined()
 })
 
-test('a press on an agent row opens a pane with its model, brief and report', async ($, on) => {
+test('a press on an agent row opens a pane with its card, outcome, steps and brief', async ($, on) => {
   const seen = engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
   await run($, 'on')
   await spawn($, 'orchestrator:scout', { name: 'scout-auth', description: 'find the auth flow', prompt: 'Goal: find where the auth token is refreshed' })
   await spawn($, 'orchestrator:builder', { model: 'sonnet', name: 'builder-retry', prompt: 'Goal: add a retry' })
-  await $.tool.call({ tool: 'Read' as const, file_path: 'auth.ts', agentId: 'agent-1' })
-  await finish($, 'agent-1', 'STATUS: done\nANSWER: refreshed in auth.ts:42', 30_000)
+  await $.tool.call({ tool: 'Read' as const, file_path: '/repo/src/auth.ts', agentId: 'agent-1' })
+  await finish($, 'agent-1', 'STATUS: done\nANSWER: refreshed in src/auth.ts:42', 30_000)
 
   // The list stays open across mounts: open it once.
   const opener = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...band() })
@@ -464,10 +470,13 @@ test('a press on an agent row opens a pane with its model, brief and report', as
 
     const pane = await $.ui.mount({ ...detailsPane, surface })
     expect(await pane.find({ type: 'Text', text: 'scout-auth' })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: 'haiku (claude-haiku-5-5)' })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: 'Goal: find where the auth token is refreshed' })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: /ANSWER: refreshed in auth.ts:42/ })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: /1 tool · last Read/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: ' DONE ' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: ' (claude-haiku-5-5)' })).toBeDefined()
+    expect(await pane.find({ type: 'Markdown', text: 'refreshed in `src/auth.ts:42`' })).toBeDefined()
+    expect(await pane.find({ type: 'Markdown', text: 'Goal: find where the auth token is refreshed' })).toBeDefined()
+    // The step, relative to the session's folder, and the file it read.
+    expect(await pane.find({ type: 'Text', text: 'src/auth.ts' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: ' file read' })).toBeDefined()
     await pane.unmount()
   }
 
@@ -476,8 +485,112 @@ test('a press on an agent row opens a pane with its model, brief and report', as
   await ui.press({ key: 'orchestrator-agent-agent-2' })
   await ui.unmount()
   const pane = await $.ui.mount({ ...detailsPane, surface: 'terminal' })
-  expect(await pane.find({ type: 'Text', text: 'sonnet (claude-sonnet-5-5)' })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: ' (claude-sonnet-5-5)' })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: ' RUNNING ' })).toBeDefined()
   expect(await pane.find({ type: 'Text', text: /No report yet/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: 'No tool calls yet.' })).toBeDefined()
+  await pane.unmount()
+})
+
+test('the pane lists each step with its target, marks the failed ones, and splits the report by field', async ($, on) => {
+  engine(on, { models: { 'orchestrator:builder': 'claude-sonnet-5-5' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:builder', { name: 'builder-auth', prompt: 'Goal: refresh the token' })
+  await $.tool.call({ tool: 'Read' as const, file_path: '/repo/src/auth.ts', offset: 10, limit: 20, agentId: 'agent-1' })
+  await $.tool.call({ tool: 'Grep', pattern: 'refresh', path: '/repo/src', agentId: 'agent-1' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/repo/src/auth.ts', old_string: 'a', new_string: 'b', agentId: 'agent-1' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'false', agentId: 'agent-1' } as never)
+  await finish(
+    $,
+    'agent-1',
+    'I looked around first.\nSTATUS: partial\nANSWER: the refresh now retries once\nEVIDENCE: src/auth.ts:42 retries; `false` failed\nCHANGES: src/auth.ts: one retry\nOPEN: the tests were not run',
+    20_000,
+  )
+  const opener = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...band() })
+  await opener.press({ key: 'orchestrator-details' })
+  await opener.unmount()
+
+  for (const surface of SURFACES) {
+    const band_ = await $.ui.mount({ plugin: PLUGIN, surface, ...band() })
+    await band_.press({ key: 'orchestrator-agent-agent-1' })
+    await band_.unmount()
+
+    const pane = await $.ui.mount({ ...detailsPane, surface })
+    expect(await pane.find({ type: 'Text', text: ' PARTIAL ' })).toBeDefined()
+    // Each call, by what it acted on, the shell's failure marked.
+    expect(await pane.find({ type: 'Text', text: 'src/auth.ts:10-30' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '"refresh" in src' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '✗ ' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: ' file edited' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '✎ src/auth.ts' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /4 tools · 1 failed/ })).toBeDefined()
+    // The report, a field to a block: one written as one line with "; " is a list.
+    expect(await pane.find({ type: 'Markdown', text: 'the refresh now retries once' })).toBeDefined()
+    expect(await pane.find({ type: 'Markdown', text: '- `src/auth.ts:42` retries  \n- `false` failed' })).toBeDefined()
+    expect(await pane.find({ type: 'Markdown', text: 'the tests were not run' })).toBeDefined()
+    expect(await pane.find({ type: 'Markdown', text: 'I looked around first.' })).toBeDefined()
+    await pane.unmount()
+  }
+})
+
+test("a verifier's verdict is drawn as a chip", async ($, on) => {
+  engine(on, { models: { 'orchestrator:verifier': 'claude-sonnet-5-5' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:verifier', { name: 'check-auth' })
+  await finish($, 'agent-1', 'STATUS: done\nANSWER: FAIL: the retry never fires', 5_000)
+  const band_ = await $.ui.mount({ plugin: PLUGIN, surface: 'desktop', ...band() })
+  await band_.press({ key: 'orchestrator-details' })
+  await band_.press({ key: 'orchestrator-agent-agent-1' })
+  await band_.unmount()
+  const pane = await $.ui.mount({ ...detailsPane, surface: 'desktop' })
+  expect(await pane.find({ type: 'Text', text: ' FAIL ' })).toBeDefined()
+  expect(await pane.find({ type: 'Markdown', text: 'the retry never fires' })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: 'No tool calls: it answered from its brief.' })).toBeDefined()
+  await pane.unmount()
+})
+
+test('long step lists and briefs show their latest part until opened whole', async ($, on) => {
+  engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
+  await run($, 'on')
+  const brief = Array.from({ length: 12 }, (_, i) => `line ${i + 1}`).join('\n')
+  await spawn($, 'orchestrator:scout', { name: 'scout-many', prompt: brief })
+  for (let i = 1; i <= 10; i++) await $.tool.call({ tool: 'Read' as const, file_path: `/repo/f${i}.ts`, agentId: 'agent-1' })
+  const opener = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...band() })
+  await opener.press({ key: 'orchestrator-details' })
+  await opener.unmount()
+
+  for (const surface of SURFACES) {
+    const band_ = await $.ui.mount({ plugin: PLUGIN, surface, ...band() })
+    await band_.press({ key: 'orchestrator-agent-agent-1' })
+    await band_.unmount()
+
+    const pane = await $.ui.mount({ ...detailsPane, surface })
+    expect(await pane.find({ type: 'Text', text: '  ⋯ 2 earlier steps' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^f1\.ts$/ })).toBeUndefined()
+    expect(await pane.find({ type: 'Text', text: /^f10\.ts$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Markdown', text: /line 8\s+\n…$/ })).toBeDefined()
+
+    await pane.press({ key: 'orchestrator-steps-toggle' })
+    await pane.press({ key: 'orchestrator-brief-toggle' })
+    expect(await pane.find({ type: 'Text', text: /^f1\.ts$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Markdown', text: /line 12$/ })).toBeDefined()
+    await pane.press({ key: 'orchestrator-steps-toggle' })
+    await pane.press({ key: 'orchestrator-brief-toggle' })
+    await pane.unmount()
+  }
+})
+
+test('a report that follows no field is drawn whole', async ($, on) => {
+  engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:scout', { name: 'scout-free' })
+  await finish($, 'agent-1', 'It is in auth.ts.\nNothing else to say.', 3_000)
+  const band_ = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...band() })
+  await band_.press({ key: 'orchestrator-details' })
+  await band_.press({ key: 'orchestrator-agent-agent-1' })
+  await band_.unmount()
+  const pane = await $.ui.mount({ ...detailsPane, surface: 'terminal' })
+  expect(await pane.find({ type: 'Markdown', text: 'It is in auth.ts.  \nNothing else to say.' })).toBeDefined()
   await pane.unmount()
 })
 
@@ -503,7 +616,7 @@ test('a follow-up answered with no tool call still updates the report and the ti
   await band_.press({ key: 'orchestrator-agent-agent-1' })
   await band_.unmount()
   const pane = await $.ui.mount({ ...detailsPane, surface: 'terminal' })
-  expect(await pane.find({ type: 'Text', text: /second answer/ })).toBeDefined()
-  expect(await pane.find({ type: 'Text', text: /first answer/ })).toBeUndefined()
+  expect(await pane.find({ type: 'Markdown', text: 'second answer' })).toBeDefined()
+  expect(await pane.find({ type: 'Markdown', text: /first answer/ })).toBeUndefined()
   await pane.unmount()
 })
