@@ -25,11 +25,13 @@ const KEEP_REPORT_CHARS = 3000
 // The steps a run keeps, its latest, and how much of each one's target.
 const KEEP_STEPS = 80
 const KEEP_TARGET_CHARS = 160
-// What the pane shows of the long sections until they are opened whole.
-const SHORT_STEPS = 8
+// What the pane shows of the brief until it is opened whole.
 const SHORT_BRIEF_LINES = 8
-// The widest bar of the tool mix, in cells.
-const BAR_CELLS = 14
+// The widest bar of the tool mix, in cells, and the detail lines under a phase.
+const BAR_CELLS = 40
+const PHASE_LINES = 3
+// The phases the pane shows until every call is opened.
+const SHOWN_PHASES = 10
 const ROLE_PREFIX = 'orchestrator:'
 const STORE_KEY = 'sessions'
 const KEEP_SESSIONS = 100
@@ -205,9 +207,62 @@ function clockOf(ms: number): string {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
 }
 
+// "claude-haiku-5-5" as "Haiku 5.5"; a model id of another shape shows its tier.
+function modelName(model: string | undefined, tier: string): string {
+  const match = /^claude-([a-z]+)-(\d+)-(\d+)/.exec(model ?? '')
+  const name = match?.[1] ?? tier
+  const pretty = name.charAt(0).toUpperCase() + name.slice(1)
+  return match?.[2] !== undefined ? `${pretty} ${match[2]}.${match[3]}` : pretty
+}
+
+// The agent's steps as a story: consecutive steps of one kind form a phase.
+type PhaseKind = 'explore' | 'research' | 'edit' | 'run' | 'other'
+type Phase = { kind: PhaseKind; steps: AgentStep[] }
+const kindOf = (tool: string): PhaseKind =>
+  FIND_TOOLS.has(tool) ? 'explore' : WEB_TOOLS.has(tool) ? 'research' : EDIT_TOOLS.has(tool) ? 'edit' : RUN_TOOLS.has(tool) ? 'run' : 'other'
+function phasesOf(steps: AgentStep[]): Phase[] {
+  const phases: Phase[] = []
+  for (const step of steps) {
+    const kind = kindOf(step.tool)
+    const last = phases.at(-1)
+    if (last !== undefined && last.kind === kind) last.steps.push(step)
+    else phases.push({ kind, steps: [step] })
+  }
+  return phases
+}
+const PHASE_LABELS: Record<PhaseKind, string> = { explore: 'Explored', research: 'Researched', edit: 'Edited', run: 'Ran commands', other: '' }
+const phaseLabel = (phase: Phase) =>
+  phase.kind === 'other' ? `Used ${[...new Set(phase.steps.map(s => s.tool))].join(', ')}` : PHASE_LABELS[phase.kind]
+// ① to ⑳, then plain numbers.
+const marker = (n: number) => (n >= 1 && n <= 20 ? String.fromCodePoint(0x2460 + n - 1) : String(n))
+
+// Cells for each tool in a bar of `cells`: in proportion to its count, one at least.
+function barCells(counts: number[], cells: number): number[] {
+  const total = counts.reduce((a, b) => a + b, 0)
+  if (total === 0) return []
+  const sizes = counts.map(n => Math.max(1, Math.round((n / total) * cells)))
+  const widest = () => sizes.indexOf(Math.max(...sizes))
+  while (sizes.reduce((a, b) => a + b, 0) > cells && Math.max(...sizes) > 1) sizes[widest()]!--
+  while (sizes.reduce((a, b) => a + b, 0) < cells) sizes[widest()]!++
+  return sizes
+}
+// Tools that share a color take turns at these, so they stay apart.
+const FILLS = ['█', '▓', '▒', '░']
+const SWATCHES = ['■', '▓', '▒', '░']
+
 // A report split by the contract's fields; null when it follows none of them.
 type Report = { status?: string; answer?: string; evidence?: string; changes?: string; open?: string; notes: string }
 const FIELD = /^\s*(?:[-*>#]+\s*)?\**(STATUS|ANSWER|EVIDENCE|CHANGES|OPEN)\**\s*:\**\s*/
+// The first word of a status, lowercase, with the markdown and the punctuation around it gone.
+const wordOf = (text: string) => /^[^A-Za-z]*([A-Za-z]+)/.exec(text)?.[1]?.toLowerCase()
+// The STATUS a report opens with, as a field in any of the forms FIELD reads.
+function statusOf(report: string): string | undefined {
+  for (const line of report.split('\n')) {
+    const match = FIELD.exec(line)
+    if (match?.[1] === 'STATUS') return wordOf(line.slice(match[0].length))
+  }
+  return undefined
+}
 function parseReport(report: string): Report | null {
   const fields: Record<string, string[]> = {}
   const notes: string[] = []
@@ -226,7 +281,7 @@ function parseReport(report: string): Report | null {
     return text === undefined || text === '' ? undefined : text
   }
   return {
-    status: field('status')?.split(/\s/)[0]?.toLowerCase(),
+    status: wordOf(field('status') ?? ''),
     answer: field('answer'),
     evidence: field('evidence'),
     changes: field('changes'),
@@ -457,7 +512,7 @@ export const register: Register = on => {
   })
 
   // The details pane: the agent whose row was pressed last. A card says who it
-  // is and where it stands; then what it achieved, the steps it took, and its brief.
+  // is and where it stands; then what it achieved, the story of its work, and its brief.
   on('ui.render', { component: 'Pane', requestId: DETAILS_PANE }, async ($, e) => {
     const { Box, Button, Markdown, Text } = $.ui.resolve(e)
     const id = await read($, selected)
@@ -471,7 +526,7 @@ export const register: Register = on => {
     const now = await $.clock.now()
     const isTerminal = e.surface === 'terminal'
     // The card's border and padding take four columns.
-    const width = Math.max(40, e.props.bodyColumns) - 4
+    const width = Math.max(16, e.props.bodyColumns) - 4
     const [glyph, glyphColor] = GLYPHS[run.status]
     const word = stateOf(run)
     const tone = TONES[word] ?? glyphColor
@@ -489,7 +544,7 @@ export const register: Register = on => {
       </Text>
     )
     const heading = (title: string, aside?: string) => (
-      <Box marginTop={1}>
+      <Box marginTop={isTerminal ? 1 : 2}>
         <Text bold size="heading" color={isTerminal ? 'claude' : undefined}>
           {isTerminal ? `▍${title.toUpperCase()}` : title}
         </Text>
@@ -505,7 +560,6 @@ export const register: Register = on => {
     )
 
     // Who it is and where it stands.
-    const model = run.model !== undefined && run.model !== run.tier ? run.model : null
     const stats: [string, string][] = [
       [timeOf(run, now), run.status === 'running' ? 'so far' : 'run time'],
       [String(run.tools), run.tools === 1 ? 'tool call' : 'tool calls'],
@@ -513,6 +567,45 @@ export const register: Register = on => {
       ...(edited.length > 0 ? [[String(edited.length), edited.length === 1 ? 'file edited' : 'files edited'] as [string, string]] : []),
       ...(failedCalls > 0 ? [[String(failedCalls), failedCalls === 1 ? 'failed call' : 'failed calls'] as [string, string]] : []),
     ]
+    const statRow = isTerminal ? (
+      <Box marginTop={1} flexWrap="wrap">
+        {stats.map(([value, what], i) => (
+          <Box key={`orchestrator-stat-${what}`}>
+            <Text bold tabular>
+              {value}
+            </Text>
+            <Text dimColor>{` ${what}`}</Text>
+            {i < stats.length - 1 && <Text dimColor>{'  ·  '}</Text>}
+          </Box>
+        ))}
+      </Box>
+    ) : (
+      <Box marginTop={1} flexWrap="wrap" gap={1}>
+        {stats.map(([value, what]) => (
+          <Box key={`orchestrator-stat-${what}`} flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
+            <Text size="title" bold tabular>
+              {value}
+            </Text>
+            <Text size="caption" dimColor>
+              {what}
+            </Text>
+          </Box>
+        ))}
+      </Box>
+    )
+    // Its role, model and age, each clipped to what is left of the line.
+    let room = width
+    const identity: [string, string | undefined, boolean][] = []
+    for (const [text, color, isDim] of [
+      [typeOf(run), toolColor(typeOf(run)), false],
+      [' · ', undefined, true],
+      [modelName(run.model, run.tier), undefined, false],
+      [` · started ${duration(now - run.startedAt)} ago`, undefined, true],
+    ] as [string, string | undefined, boolean][]) {
+      const shown = clip(text, room)
+      room -= shown.length
+      if (shown !== '') identity.push([shown, color, isDim])
+    }
     const card = (
       <Box flexDirection="column" borderStyle="round" borderColor={tone} paddingX={1}>
         <Box justifyContent="space-between">
@@ -526,36 +619,35 @@ export const register: Register = on => {
         </Box>
         {run.name !== null && <Text>{run.description}</Text>}
         <Box>
-          <Text color={toolColor(typeOf(run))}>{typeOf(run)}</Text>
-          <Text dimColor>{' · '}</Text>
-          <Text>{run.tier}</Text>
-          {model !== null && <Text dimColor>{` (${model})`}</Text>}
-          <Text dimColor>{` · started ${duration(now - run.startedAt)} ago`}</Text>
-        </Box>
-        <Box marginTop={1} flexWrap="wrap" columnGap={3}>
-          {stats.map(([value, what]) => (
-            <Box key={`orchestrator-stat-${what}`}>
-              <Text bold tabular>
-                {value}
-              </Text>
-              <Text dimColor>{` ${what}`}</Text>
-            </Box>
+          {identity.map(([text, color, isDim], i) => (
+            <Text key={`orchestrator-identity-${i}`} color={color} dimColor={isDim}>
+              {text}
+            </Text>
           ))}
         </Box>
+        {statRow}
       </Box>
     )
 
-    // What it achieved: the report, by the contract's fields.
+    // What it achieved: the report, by the contract's fields, the answer boxed in its state's color.
     const latest = steps.at(-1)
+    const answerBox = (caption: string, body: ReturnType<typeof Markdown> | (JSX.Element | false)[]) => (
+      <Box flexDirection="column" borderStyle="round" borderColor={tone} paddingX={1}>
+        <Text dimColor size="caption">
+          {caption}
+        </Text>
+        {body}
+      </Box>
+    )
     let outcome
     if (report === null) {
       outcome =
         run.status === 'running' ? (
           <Box flexDirection="column">
-            <Text color="suggestion">No report yet: the agent is still working.</Text>
+            <Text color="suggestion">● Working</Text>
             {latest !== undefined && (
               <Box>
-                <Text dimColor>{'Now: '}</Text>
+                <Text dimColor>{'now: '}</Text>
                 <Text color={toolColor(latest.tool)}>{latest.tool}</Text>
                 <Text>{` ${clip(latest.target, width - latest.tool.length - 6)}`}</Text>
               </Box>
@@ -565,36 +657,54 @@ export const register: Register = on => {
           <Text dimColor>{run.status === 'killed' ? 'Stopped before it reported.' : 'No report.'}</Text>
         )
     } else if (parsed === null) {
-      outcome = <Markdown key="orchestrator-report" text={hardBreaks(report)} />
+      outcome = answerBox('Report', <Markdown key="orchestrator-report" text={hardBreaks(report)} />)
     } else {
       const verdict = /^(PASS|FAIL|CONCERNS)\b[\s:.,-]*/.exec(parsed.answer ?? '')
       const verdictTone = verdict?.[1] === 'PASS' ? 'success' : verdict?.[1] === 'FAIL' ? 'error' : 'warning'
       const answer = verdict !== null ? (parsed.answer ?? '').slice(verdict[0].length) : parsed.answer
+      const hasAnswer = answer !== undefined && answer !== ''
+      const evidence =
+        parsed.evidence !== undefined ? (
+          <Box key="orchestrator-evidence-block" flexDirection="column">
+            {label('⌕ Evidence', 'suggestion')}
+            <Markdown key="orchestrator-evidence" text={hardBreaks(listify(parsed.evidence))} />
+          </Box>
+        ) : null
+      const open =
+        parsed.open !== undefined ? (
+          <Box key="orchestrator-open-block" flexDirection="column">
+            {label('⚑ Open questions & risks', 'warning')}
+            <Markdown key="orchestrator-open" text={hardBreaks(listify(parsed.open))} />
+          </Box>
+        ) : null
+      const openFirst = parsed.status === 'partial' || parsed.status === 'blocked'
       outcome = (
         <Box flexDirection="column">
-          {verdict?.[1] !== undefined && <Box marginBottom={1}>{chip(verdict[1], verdictTone)}</Box>}
-          {answer !== undefined && answer !== '' && <Markdown key="orchestrator-answer" text={hardBreaks(codeRefs(answer))} />}
+          {(verdict?.[1] !== undefined || hasAnswer) &&
+            answerBox('Answer', [
+              verdict?.[1] !== undefined && (
+                <Box key="orchestrator-verdict" marginBottom={hasAnswer ? 1 : 0}>
+                  {chip(verdict[1], verdictTone)}
+                </Box>
+              ),
+              hasAnswer && <Markdown key="orchestrator-answer" text={hardBreaks(codeRefs(answer))} />,
+            ])}
           {parsed.changes !== undefined && label('✎ Changes', 'success')}
           {parsed.changes !== undefined && <Markdown key="orchestrator-changes" text={hardBreaks(listify(parsed.changes))} />}
-          {parsed.evidence !== undefined && label('⌕ Evidence', 'suggestion')}
-          {parsed.evidence !== undefined && <Markdown key="orchestrator-evidence" text={hardBreaks(listify(parsed.evidence))} />}
-          {parsed.open !== undefined && label('⚑ Open', 'warning')}
-          {parsed.open !== undefined && <Markdown key="orchestrator-open" text={hardBreaks(listify(parsed.open))} />}
+          {openFirst ? open : evidence}
+          {openFirst ? evidence : open}
           {parsed.notes !== '' && label('Notes')}
           {parsed.notes !== '' && <Markdown key="orchestrator-notes" dimColor text={hardBreaks(parsed.notes)} />}
         </Box>
       )
     }
 
-    // The steps it took: which tools, which files, and each call in order.
+    // What it did: its phases in order, the tools it used, its files, and every call.
     const counts: Record<string, number> = {}
     for (const step of steps) counts[step.tool] = (counts[step.tool] ?? 0) + 1
     const mix = Object.entries(counts).sort((a, b) => b[1] - a[1])
-    const most = mix[0]?.[1] ?? 1
     const nameCells = Math.min(12, Math.max(4, ...steps.map(s => s.tool.length)))
     const dropped = (latest?.n ?? 0) - steps.length
-    const shownSteps = allSteps ? steps : steps.slice(-SHORT_STEPS)
-    const hidden = steps.length - shownSteps.length
     const targetCells = width - 2 - 6 - nameCells - 1 - 6
     const stepRow = (step: AgentStep) => {
       const [mark, markColor] = step.ms === null ? ['●', 'warning'] : step.isError ? ['✗', 'error'] : ['✓', 'success']
@@ -612,6 +722,86 @@ export const register: Register = on => {
         </Box>
       )
     }
+
+    const phases = phasesOf(steps)
+    const earlier = allSteps ? 0 : Math.max(0, phases.length - SHOWN_PHASES)
+    const isWorking = run.status === 'running' && latest !== undefined && latest.ms === null
+    const lineCells = width - 4
+    const phaseView = (phase: Phase, index: number) => {
+      const first = phase.steps[0] as AgentStep
+      const last = phase.steps.at(-1) as AgentStep
+      const tally: Record<string, number> = {}
+      for (const step of phase.steps) tally[step.tool] = (tally[step.tool] ?? 0) + 1
+      const failed = phase.steps.filter(s => s.isError).length
+      // Up to three detail lines, then how many more there were.
+      const lines: { text: string; mark?: string; markColor?: string }[] =
+        phase.kind === 'edit'
+          ? [...new Set(phase.steps.map(s => s.path ?? s.target).filter(t => t !== ''))].map(path => ({ text: `✎ ${path}` }))
+          : phase.kind === 'run'
+            ? phase.steps.filter(s => s.target !== '').map(s => ({ text: s.target, mark: s.ms === null ? '●' : s.isError ? '✗' : '✓', markColor: s.ms === null ? 'warning' : s.isError ? 'error' : undefined }))
+            : [...new Set(phase.steps.map(s => s.target).filter(t => t !== ''))].map(text => ({ text }))
+      const shown = lines.slice(0, PHASE_LINES)
+      const more = lines.length - shown.length
+      const span = `${clockOf(first.at)}–${clockOf(last.ms !== null ? last.at + last.ms : last.at)}`
+      return (
+        <Box key={`orchestrator-phase-${index}`} flexDirection="column" marginTop={1}>
+          <Box flexWrap="wrap" columnGap={1}>
+            <Text bold color={toolColor(first.tool)}>{marker(index + 1)}</Text>
+            <Text bold color={toolColor(first.tool)}>{clip(phaseLabel(phase), width - 4)}</Text>
+            <Text dimColor>·</Text>
+            <Text dimColor tabular>{span}</Text>
+            <Text dimColor>·</Text>
+            <Text>{Object.entries(tally).map(([tool, n]) => `${tool} ×${n}`).join(' · ')}</Text>
+            {failed > 0 && <Text color="error">{`${failed} failed`}</Text>}
+            {isWorking && index === phases.length - 1 && <Text color="warning">● in progress</Text>}
+          </Box>
+          {shown.map((line, i) => (
+            <Box key={`orchestrator-phase-${index}-line-${i}`} paddingLeft={3}>
+              {line.mark !== undefined && <Text color={line.markColor} dimColor={line.markColor === undefined}>{`${line.mark} `}</Text>}
+              <Text dimColor={line.markColor !== 'error'} color={line.markColor === 'error' ? 'error' : undefined}>
+                {clip(line.text, lineCells - (line.mark !== undefined ? 2 : 0))}
+              </Text>
+            </Box>
+          ))}
+          {more > 0 && (
+            <Box paddingLeft={3}>
+              <Text dimColor>{`+${more} more`}</Text>
+            </Box>
+          )}
+        </Box>
+      )
+    }
+
+    // One bar for the tool mix: cells in proportion to each tool's calls. Where there
+    // are more tools than cells, the smallest share one "other" segment.
+    const barWidth = Math.min(BAR_CELLS, width)
+    const segments: [string, number][] =
+      mix.length > barWidth ? [...mix.slice(0, barWidth - 1), ['other', mix.slice(barWidth - 1).reduce((sum, [, n]) => sum + n, 0)]] : mix
+    const sizes = barCells(segments.map(([, n]) => n), barWidth)
+    const seenColors: Record<string, number> = {}
+    const fills = segments.map(([tool]) => {
+      const color = toolColor(tool)
+      const turn = seenColors[color] ?? 0
+      seenColors[color] = turn + 1
+      return turn % FILLS.length
+    })
+    const toolMix = (
+      <Box flexDirection="column">
+        <Box>
+          {segments.map(([tool], i) => (
+            <Text key={`orchestrator-bar-${tool}`} mono color={toolColor(tool)}>
+              {(FILLS[fills[i] as number] as string).repeat(sizes[i] as number)}
+            </Text>
+          ))}
+        </Box>
+        <Box marginTop={1} flexWrap="wrap" columnGap={2}>
+          {segments.map(([tool, n], i) => (
+            <Text key={`orchestrator-legend-${tool}`} mono color={toolColor(tool)}>{clip(`${SWATCHES[fills[i] as number]} ${tool} ${n}`, width)}</Text>
+          ))}
+        </Box>
+      </Box>
+    )
+
     const activity =
       steps.length === 0 ? (
         <Text dimColor>
@@ -623,15 +813,14 @@ export const register: Register = on => {
         </Text>
       ) : (
         <Box flexDirection="column">
-          {mix.map(([tool, n]) => (
-            <Box key={`orchestrator-mix-${tool}`}>
-              <Text mono color={toolColor(tool)}>{`${clip(tool, nameCells).padEnd(nameCells)} `}</Text>
-              <Text mono color={toolColor(tool)}>
-                {'█'.repeat(Math.max(1, Math.round((n / most) * BAR_CELLS)))}
-              </Text>
-              <Text dimColor tabular>{` ${n}`}</Text>
+          {earlier > 0 && (
+            <Box marginTop={1}>
+              <Text dimColor>{`⋯ ${earlier} earlier ${earlier === 1 ? 'phase' : 'phases'}`}</Text>
             </Box>
-          ))}
+          )}
+          {phases.slice(earlier).map((phase, i) => phaseView(phase, earlier + i))}
+          {label('Tool mix')}
+          {toolMix}
           {edited.length > 0 && label('Files edited', 'success')}
           {edited.map(path => (
             <Text key={`orchestrator-edited-${path}`} mono>{`✎ ${clip(path, width - 2)}`}</Text>
@@ -640,24 +829,20 @@ export const register: Register = on => {
           {readFiles.length > 0 && (
             <Text dimColor>{clip(readFiles.slice(0, 6).join(', ') + (readFiles.length > 6 ? ` +${readFiles.length - 6} more` : ''), width * 2)}</Text>
           )}
-          {label('Steps')}
-          {dropped > 0 && <Text dimColor>{`  The first ${dropped} calls were not kept.`}</Text>}
-          {hidden > 0 && <Text dimColor>{`  ⋯ ${hidden} earlier ${hidden === 1 ? 'step' : 'steps'}`}</Text>}
-          {shownSteps.map(stepRow)}
-          {steps.length > SHORT_STEPS && (
-            <Box marginTop={1}>
-              <Button
-                key="orchestrator-steps-toggle"
-                {...(isTerminal ? { plain: true as const } : { variant: "secondary" as const })}
-                label={allSteps ? '▴ Show the latest only' : `▾ Show all ${steps.length} steps`}
-                onPress={() => update($, showAllSteps, (open: boolean) => !open)}
-              />
-            </Box>
-          )}
+          <Box marginTop={1}>
+            <Button
+              key="orchestrator-steps-toggle"
+              {...(isTerminal ? { plain: true as const } : { variant: 'secondary' as const })}
+              label={allSteps ? '▴ Hide the calls' : `▾ Show every call (${steps.length})`}
+              onPress={() => update($, showAllSteps, (open: boolean) => !open)}
+            />
+          </Box>
+          {allSteps && dropped > 0 && <Text dimColor>{`  The first ${dropped} calls were not kept.`}</Text>}
+          {allSteps && steps.map(stepRow)}
         </Box>
       )
 
-    // The brief it was given.
+    // The brief it was given, as a quoted document.
     const briefLines = kept?.brief.split('\n') ?? []
     const isLong = briefLines.length > SHORT_BRIEF_LINES
     const briefText = isLong && !fullBrief ? `${briefLines.slice(0, SHORT_BRIEF_LINES).join('\n')}\n…` : (kept?.brief ?? '')
@@ -666,12 +851,14 @@ export const register: Register = on => {
         <Text dimColor>Not kept: this agent started before the mod kept briefs.</Text>
       ) : (
         <Box flexDirection="column">
-          <Markdown key="orchestrator-brief" text={hardBreaks(briefText)} />
+          <Box borderStyle="round" borderDimColor paddingX={1}>
+            <Markdown key="orchestrator-brief" text={hardBreaks(briefText)} />
+          </Box>
           {isLong && (
             <Box marginTop={1}>
               <Button
                 key="orchestrator-brief-toggle"
-                {...(isTerminal ? { plain: true as const } : { variant: "secondary" as const })}
+                {...(isTerminal ? { plain: true as const } : { variant: 'secondary' as const })}
                 label={fullBrief ? '▴ Show less' : `▾ Show the full brief (${briefLines.length} lines)`}
                 onPress={() => update($, showFullBrief, (open: boolean) => !open)}
               />
@@ -686,7 +873,7 @@ export const register: Register = on => {
         {card}
         {heading('Outcome', parsed?.status !== undefined && parsed.status !== word ? `reported ${parsed.status}` : undefined)}
         {outcome}
-        {heading('Activity', stepsAside)}
+        {heading('What it did', stepsAside)}
         {activity}
         {heading('Brief', kept !== undefined ? `${briefLines.length} ${briefLines.length === 1 ? 'line' : 'lines'}` : undefined)}
         {brief}
@@ -773,7 +960,7 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     if (e.agentId !== undefined) {
       const status = e.reason === 'answer' ? 'completed' : e.reason === 'aborted' ? 'killed' : 'failed'
-      const outcome = /^STATUS:\s*([a-z]+)/im.exec(e.answer)?.[1]?.toLowerCase() ?? null
+      const outcome = statusOf(e.answer) ?? null
       await changeRun($, e.agentId, run =>
         run.status === 'running'
           ? { ...run, status, outcome, runMs: run.runMs + e.durationMs }

@@ -471,12 +471,14 @@ test('a press on an agent row opens a pane with its card, outcome, steps and bri
     const pane = await $.ui.mount({ ...detailsPane, surface })
     expect(await pane.find({ type: 'Text', text: 'scout-auth' })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: ' DONE ' })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: ' (claude-haiku-5-5)' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'Haiku 5.5' })).toBeDefined()
     expect(await pane.find({ type: 'Markdown', text: 'refreshed in `src/auth.ts:42`' })).toBeDefined()
     expect(await pane.find({ type: 'Markdown', text: 'Goal: find where the auth token is refreshed' })).toBeDefined()
     // The step, relative to the session's folder, and the file it read.
     expect(await pane.find({ type: 'Text', text: 'src/auth.ts' })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: ' file read' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'file read' })).toBeDefined()
+    // The answer sits in its own box, under a small caption.
+    expect(await pane.find({ type: 'Text', text: 'Answer' })).toBeDefined()
     await pane.unmount()
   }
 
@@ -485,14 +487,14 @@ test('a press on an agent row opens a pane with its card, outcome, steps and bri
   await ui.press({ key: 'orchestrator-agent-agent-2' })
   await ui.unmount()
   const pane = await $.ui.mount({ ...detailsPane, surface: 'terminal' })
-  expect(await pane.find({ type: 'Text', text: ' (claude-sonnet-5-5)' })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: 'Sonnet 5.5' })).toBeDefined()
   expect(await pane.find({ type: 'Text', text: ' RUNNING ' })).toBeDefined()
-  expect(await pane.find({ type: 'Text', text: /No report yet/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: '● Working' })).toBeDefined()
   expect(await pane.find({ type: 'Text', text: 'No tool calls yet.' })).toBeDefined()
   await pane.unmount()
 })
 
-test('the pane lists each step with its target, marks the failed ones, and splits the report by field', async ($, on) => {
+test('the pane tells the work as phases, marks the failed ones, and splits the report by field', async ($, on) => {
   engine(on, { models: { 'orchestrator:builder': 'claude-sonnet-5-5' } })
   await run($, 'on')
   await spawn($, 'orchestrator:builder', { name: 'builder-auth', prompt: 'Goal: refresh the token' })
@@ -517,11 +519,11 @@ test('the pane lists each step with its target, marks the failed ones, and split
 
     const pane = await $.ui.mount({ ...detailsPane, surface })
     expect(await pane.find({ type: 'Text', text: ' PARTIAL ' })).toBeDefined()
-    // Each call, by what it acted on, the shell's failure marked.
+    // Each phase, by what it acted on, the shell's failure marked.
     expect(await pane.find({ type: 'Text', text: 'src/auth.ts:10-30' })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: '"refresh" in src' })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: '✗ ' })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: ' file edited' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'file edited' })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: '✎ src/auth.ts' })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: /4 tools · 1 failed/ })).toBeDefined()
     // The report, a field to a block: one written as one line with "; " is a list.
@@ -529,6 +531,191 @@ test('the pane lists each step with its target, marks the failed ones, and split
     expect(await pane.find({ type: 'Markdown', text: '- `src/auth.ts:42` retries  \n- `false` failed' })).toBeDefined()
     expect(await pane.find({ type: 'Markdown', text: 'the tests were not run' })).toBeDefined()
     expect(await pane.find({ type: 'Markdown', text: 'I looked around first.' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '✎ Changes' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '⌕ Evidence' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '⚑ Open questions & risks' })).toBeDefined()
+    await pane.unmount()
+  }
+})
+
+// The pane for the agent pressed first, its list opened once for every surface.
+async function showAgent($: Engine, id: string, surface: (typeof SURFACES)[number], bodyColumns = 80) {
+  const band_ = await $.ui.mount({ plugin: PLUGIN, surface, ...band() })
+  await band_.press({ key: `orchestrator-agent-${id}` })
+  await band_.unmount()
+  return $.ui.mount({ ...detailsPane, props: { ...detailsPane.props, bodyColumns }, surface })
+}
+const showFirst = ($: Engine, surface: (typeof SURFACES)[number]) => showAgent($, 'agent-1', surface)
+async function openList($: Engine) {
+  const opener = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...band() })
+  await opener.press({ key: 'orchestrator-details' })
+  await opener.unmount()
+}
+
+test('consecutive calls of one kind form a phase, with its time, its tally, its files and its failures', async ($, on) => {
+  engine(on, { models: { 'orchestrator:builder': 'claude-sonnet-5-5' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:builder', { name: 'builder-auth' })
+  await $.tool.call({ tool: 'Read' as const, file_path: '/repo/src/auth.ts', agentId: 'agent-1' })
+  await $.tool.call({ tool: 'Read' as const, file_path: '/repo/src/session.ts', agentId: 'agent-1' })
+  await $.tool.call({ tool: 'Grep', pattern: 'refresh', agentId: 'agent-1' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/repo/src/auth.ts', old_string: 'a', new_string: 'b', agentId: 'agent-1' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'false', agentId: 'agent-1' } as never)
+  await finish($, 'agent-1', 'STATUS: done\nANSWER: retried', 9_000)
+  await openList($)
+
+  for (const surface of SURFACES) {
+    const pane = await showFirst($, surface)
+    // Three phases, each numbered and named in order.
+    expect(await pane.find({ type: 'Text', text: '①' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '②' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '③' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '④' })).toBeUndefined()
+    expect(await pane.find({ type: 'Text', text: /^Explored$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^Edited$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^Ran commands$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^Read ×2 · Grep ×1$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^Edit ×1$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^Bash ×1$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^\d+:\d\d–\d+:\d\d$/ })).toBeDefined()
+    // The edit phase names its file, the explore phase its targets, the run its command, failed.
+    expect(await pane.find({ type: 'Text', text: /^✎ src\/auth\.ts$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^src\/session\.ts$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^false$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '✗ ' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^1 failed$/ })).toBeDefined()
+    // Nothing is running, so none is in progress.
+    expect(await pane.find({ type: 'Text', text: '● in progress' })).toBeUndefined()
+    await pane.unmount()
+  }
+})
+
+test('a phase of many targets shows three and counts the rest', async ($, on) => {
+  engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:scout', { name: 'scout-many' })
+  for (let i = 1; i <= 5; i++) await $.tool.call({ tool: 'Read' as const, file_path: `/repo/f${i}.ts`, agentId: 'agent-1' })
+  await openList($)
+
+  for (const surface of SURFACES) {
+    const pane = await showFirst($, surface)
+    expect(await pane.find({ type: 'Text', text: /^f3\.ts$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^f4\.ts$/ })).toBeUndefined()
+    expect(await pane.find({ type: 'Text', text: '+2 more' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^Read ×5$/ })).toBeDefined()
+    await pane.unmount()
+  }
+})
+
+test('the tool mix is one stacked bar with a legend, and tools of one color take different fills', async ($, on) => {
+  engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:scout', { name: 'scout-mix' })
+  for (let i = 1; i <= 6; i++) await $.tool.call({ tool: 'Read' as const, file_path: `/repo/f${i}.ts`, agentId: 'agent-1' })
+  for (let i = 1; i <= 3; i++) await $.tool.call({ tool: 'Grep', pattern: `p${i}`, agentId: 'agent-1' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'agent-1' } as never)
+  await openList($)
+
+  for (const surface of SURFACES) {
+    const pane = await showFirst($, surface)
+    // Read and Grep share a color: the first fills with ■, the second with ▓.
+    expect(await pane.find({ type: 'Text', text: /^■ Read 6$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^▓ Grep 3$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^■ Bash 1$/ })).toBeDefined()
+    // Its bar spans at most 40 cells, in proportion: 6 of 10 calls take 24.
+    expect(await pane.find({ type: 'Text', text: /^█{24}$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^▓{12}$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^█{4}$/ })).toBeDefined()
+    await pane.unmount()
+  }
+})
+
+test('a status written in markdown or with a full stop still reads as the status', async ($, on) => {
+  engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:scout', { name: 'scout-bold' })
+  await spawn($, 'orchestrator:scout', { name: 'scout-dot' })
+  await finish($, 'agent-1', '**STATUS:** partial\nANSWER: half of it', 5_000)
+  await finish($, 'agent-2', '- STATUS: partial.\nANSWER: half of it\nEVIDENCE: a.ts:1\nOPEN: the rest', 5_000)
+  await openList($)
+
+  for (const surface of SURFACES) {
+    const band_ = await $.ui.mount({ plugin: PLUGIN, surface, ...band() })
+    expect(await band_.find({ type: 'Button', text: /^scout-bold · scout · haiku · partial ·/ })).toBeDefined()
+    expect(await band_.find({ type: 'Button', text: /^scout-dot · scout · haiku · partial ·/ })).toBeDefined()
+    await band_.unmount()
+
+    // The card's chip agrees with the report, and the open questions come first.
+    const pane = await showFirst($, surface)
+    expect(await pane.find({ type: 'Text', text: ' PARTIAL ' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /reported/ })).toBeUndefined()
+    await pane.unmount()
+
+    const dotted = await showAgent($, 'agent-2', surface)
+    const labels = await dotted.findAll({ type: 'Text', text: /^(⌕ Evidence|⚑ Open questions & risks)$/ })
+    expect(labels.map(l => l.text)).toEqual(['⚑ Open questions & risks', '⌕ Evidence'])
+    await dotted.unmount()
+  }
+})
+
+test('more tools than the bar has cells fold the smallest into one other segment, filling the width exactly', async ($, on) => {
+  engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:scout', { name: 'scout-wide' })
+  for (let i = 1; i <= 20; i++) await $.tool.call({ tool: `mcp__t__a${i}`, agentId: 'agent-1' } as never)
+  await openList($)
+
+  for (const surface of SURFACES) {
+    // 20 columns leave 16 cells: 15 tools and the rest as "other".
+    const pane = await showAgent($, 'agent-1', surface, 20)
+    const cells = (await pane.findAll({ type: 'Text', text: /^[█▓▒░]+$/ })).reduce((sum, t) => sum + String(t.text).length, 0)
+    expect(cells).toBe(16)
+    expect(await pane.find({ type: 'Text', text: /other 5$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /mcp__t__a16 1/ })).toBeUndefined()
+    await pane.unmount()
+  }
+})
+
+test('a call with no target adds no empty detail line', async ($, on) => {
+  engine(on, { models: { 'orchestrator:builder': 'claude-sonnet-5-5' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:builder', { name: 'builder-bare' })
+  await $.tool.call({ tool: 'Edit', agentId: 'agent-1' } as never)
+  await $.tool.call({ tool: 'Bash', agentId: 'agent-1' } as never)
+  await openList($)
+
+  for (const surface of SURFACES) {
+    const pane = await showFirst($, surface)
+    expect(await pane.find({ type: 'Text', text: /^Edited$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^Ran commands$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^✎\s*$/ })).toBeUndefined()
+    expect(await pane.find({ type: 'Text', text: /^[✓✗]\s*$/ })).toBeUndefined()
+    await pane.unmount()
+  }
+})
+
+test('only the latest ten phases show until every call is opened', async ($, on) => {
+  engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
+  await run($, 'on')
+  await spawn($, 'orchestrator:scout', { name: 'scout-long' })
+  for (let i = 1; i <= 6; i++) {
+    await $.tool.call({ tool: 'Read' as const, file_path: `/repo/f${i}.ts`, agentId: 'agent-1' })
+    await $.tool.call({ tool: 'Bash', command: `echo ${i}`, agentId: 'agent-1' } as never)
+  }
+  await openList($)
+
+  for (const surface of SURFACES) {
+    const pane = await showFirst($, surface)
+    expect(await pane.find({ type: 'Text', text: '⋯ 2 earlier phases' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '②' })).toBeUndefined()
+    expect(await pane.find({ type: 'Text', text: '③' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '⑫' })).toBeDefined()
+
+    await pane.press({ key: 'orchestrator-steps-toggle' })
+    expect(await pane.find({ type: 'Text', text: /earlier phases/ })).toBeUndefined()
+    expect(await pane.find({ type: 'Text', text: '①' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: '②' })).toBeDefined()
+    await pane.press({ key: 'orchestrator-steps-toggle' })
     await pane.unmount()
   }
 })
@@ -549,30 +736,25 @@ test("a verifier's verdict is drawn as a chip", async ($, on) => {
   await pane.unmount()
 })
 
-test('long step lists and briefs show their latest part until opened whole', async ($, on) => {
+test('every call and a long brief stay folded until opened whole', async ($, on) => {
   engine(on, { models: { 'orchestrator:scout': 'claude-haiku-5-5' } })
   await run($, 'on')
   const brief = Array.from({ length: 12 }, (_, i) => `line ${i + 1}`).join('\n')
   await spawn($, 'orchestrator:scout', { name: 'scout-many', prompt: brief })
   for (let i = 1; i <= 10; i++) await $.tool.call({ tool: 'Read' as const, file_path: `/repo/f${i}.ts`, agentId: 'agent-1' })
-  const opener = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...band() })
-  await opener.press({ key: 'orchestrator-details' })
-  await opener.unmount()
+  await openList($)
 
   for (const surface of SURFACES) {
-    const band_ = await $.ui.mount({ plugin: PLUGIN, surface, ...band() })
-    await band_.press({ key: 'orchestrator-agent-agent-1' })
-    await band_.unmount()
-
-    const pane = await $.ui.mount({ ...detailsPane, surface })
-    expect(await pane.find({ type: 'Text', text: '  ⋯ 2 earlier steps' })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: /^f1\.ts$/ })).toBeUndefined()
-    expect(await pane.find({ type: 'Text', text: /^f10\.ts$/ })).toBeDefined()
+    const pane = await showFirst($, surface)
+    expect((await pane.find({ key: 'orchestrator-steps-toggle' }))?.props.label).toBe('▾ Show every call (10)')
+    expect(await pane.find({ key: 'orchestrator-step-1' })).toBeUndefined()
     expect(await pane.find({ type: 'Markdown', text: /line 8\s+\n…$/ })).toBeDefined()
 
     await pane.press({ key: 'orchestrator-steps-toggle' })
     await pane.press({ key: 'orchestrator-brief-toggle' })
-    expect(await pane.find({ type: 'Text', text: /^f1\.ts$/ })).toBeDefined()
+    expect((await pane.find({ key: 'orchestrator-steps-toggle' }))?.props.label).toBe('▴ Hide the calls')
+    expect(await pane.find({ key: 'orchestrator-step-1' })).toBeDefined()
+    expect(await pane.find({ key: 'orchestrator-step-10' })).toBeDefined()
     expect(await pane.find({ type: 'Markdown', text: /line 12$/ })).toBeDefined()
     await pane.press({ key: 'orchestrator-steps-toggle' })
     await pane.press({ key: 'orchestrator-brief-toggle' })
