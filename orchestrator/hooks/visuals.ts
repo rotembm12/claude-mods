@@ -6,7 +6,8 @@
 //                                         peak marker, output bars, a strip colored by tool kind
 //   timelineSvg(steps, opts)              one swimlane per tool kind, a bar per call over time
 //   timelineHeight(steps, rowH?)          a height that fits timelineSvg's lanes
-//   budgetRingSvg(peak, budget, opts)     a gauge of peak context against the budget
+//   budgetMeterSvg(peak, budget, opts)    a slim bar of peak context against the budget
+//   mixBarSvg(segments, opts)             one bar split by each tool's share of the calls
 //   statusOrbSvg(state, opts)             a small glyph for an agent's state
 //   sparkline(values, width)              ▁▂▃▄▅▆▇█, resampled to exactly `width` cells
 //   formatTokens(n)                       "812", "48.2K", "1.2M"
@@ -53,6 +54,8 @@ export const kindOf = (tool: string): Kind =>
   FIND_TOOLS.has(tool) ? 'explore' : WEB_TOOLS.has(tool) ? 'research' : EDIT_TOOLS.has(tool) ? 'edit' : RUN_TOOLS.has(tool) ? 'run' : 'other'
 
 const MAX_POINTS = 160
+// The one color of the context line and its fill; red takes over past the budget.
+const ACCENT = '#38bdf8'
 const FONT = 'system-ui,-apple-system,"Segoe UI",sans-serif'
 
 // ---------------------------------------------------------------------------
@@ -242,21 +245,18 @@ export function tokenChartSvg(requests: readonly AgentRequest[], steps: readonly
   const defs: string[] = []
   const cls = (name: string, delay?: number): string => (animate ? ` class="${name}"${delay !== undefined ? ` style="animation-delay:${Math.round(delay * 1000)}ms"` : ''}` : '')
 
-  // Header
-  out.push(`<text x="${padL}" y="14" font-size="11" font-weight="600" fill="${PALETTE.label}">Context per request</text>`)
-
   // Grid and y axis
   const target = clamp(Math.floor(plotH / 38), 2, 5)
   const tickStep = TICK_STEPS.find((s) => yMax / s <= target) ?? 5e6
   for (let v = 0; v <= yMax; v += tickStep) {
     const ty = y(v)
-    out.push(`<line x1="${padL}" x2="${W - padR}" y1="${r1(ty)}" y2="${r1(ty)}" stroke="${PALETTE.muted}" stroke-opacity="${v === 0 ? 0.45 : 0.18}" stroke-width="1"/>`)
+    out.push(`<line x1="${padL}" x2="${W - padR}" y1="${r1(ty)}" y2="${r1(ty)}" stroke="${PALETTE.muted}" stroke-opacity="${v === 0 ? 0.35 : 0.12}" stroke-width="1"/>`)
     if (v === 0 || Math.abs(ty - yB) > 9) out.push(`<text x="${padL - 6}" y="${r1(ty + 3.5)}" font-size="10" text-anchor="end" fill="${PALETTE.label}">${formatTokens(v)}</text>`)
   }
 
   // Over-budget zone, and the budget line.
   const over = peakAll > budget
-  out.push(`<rect x="${padL}" y="${r1(top)}" width="${W - padL - padR}" height="${r1(Math.max(0, yB - top))}" fill="${PALETTE.bad}" fill-opacity="${over ? 0.09 : 0.045}"/>`)
+  out.push(`<rect x="${padL}" y="${r1(top)}" width="${W - padL - padR}" height="${r1(Math.max(0, yB - top))}" fill="${PALETTE.bad}" fill-opacity="${over ? 0.06 : 0.03}"/>`)
 
   if (requests.length === 0) {
     // Placeholder: a ghost of the curve to come, and a line saying so.
@@ -266,23 +266,10 @@ export function tokenChartSvg(requests: readonly AgentRequest[], steps: readonly
     out.push(`<text x="${r1((plotL + plotR) / 2)}" y="${r1((yB + y(budget * 0.667)) / 2 - 8)}" font-size="13" font-weight="600" text-anchor="middle" fill="${PALETTE.label}">Waiting for the first request</text>`)
     out.push(`<text x="${r1((plotL + plotR) / 2)}" y="${r1((yB + y(budget * 0.667)) / 2 + 8)}" font-size="10.5" text-anchor="middle" fill="${PALETTE.label}" fill-opacity="0.8">Context growth draws here as the agent works</text>`)
   } else {
-    // Gradient stops by height: red at the budget, amber nearing it, green below.
-    const off = (v: number): number => Math.round(clamp((y(v) - top) / plotH, 0, 1) * 1000) / 1000
-    const stops = (alpha: number[], solid: boolean): string =>
-      [
-        [0, PALETTE.bad],
-        [off(budget), PALETTE.bad],
-        [off(budget * 0.85), PALETTE.warn],
-        [off(budget * 0.65), '#84cc16'],
-        [off(budget * 0.45), PALETTE.good],
-        [1, PALETTE.good],
-      ]
-        .map(([o, c], i) => `<stop offset="${o}" stop-color="${c}" stop-opacity="${solid ? 1 : alpha[i]}"/>`)
-        .join('')
-    defs.push(`<linearGradient id="${id}-f" gradientUnits="userSpaceOnUse" x1="0" y1="${r1(top)}" x2="0" y2="${r1(bottom)}">${stops([0.62, 0.55, 0.46, 0.4, 0.34, 0.03], false)}</linearGradient>`)
-    defs.push(`<linearGradient id="${id}-s" gradientUnits="userSpaceOnUse" x1="0" y1="${r1(top)}" x2="0" y2="${r1(bottom)}">${stops([], true)}</linearGradient>`)
-    defs.push(`<pattern id="${id}-h" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)"><rect width="2.4" height="6" fill="${PALETTE.bad}" fill-opacity="0.5"/></pattern>`)
-    defs.push(`<clipPath id="${id}-o"><rect x="${padL}" y="${r1(top - 4)}" width="${W - padL - padR}" height="${r1(Math.max(0, yB - top + 4))}"/></clipPath>`)
+    // One accent: a soft fill under the line, fading to nothing at the base. What lies past
+    // the budget is drawn again in red, clipped to the zone above the budget line.
+    defs.push(`<linearGradient id="${id}-f" gradientUnits="userSpaceOnUse" x1="0" y1="${r1(y(peakAll))}" x2="0" y2="${r1(bottom)}"><stop offset="0" stop-color="${ACCENT}" stop-opacity="0.3"/><stop offset="1" stop-color="${ACCENT}" stop-opacity="0.02"/></linearGradient>`)
+    defs.push(`<clipPath id="${id}-o"><rect x="${padL}" y="${r1(top - 8)}" width="${W - padL - padR}" height="${r1(Math.max(0, yB - top + 8))}"/></clipPath>`)
     const line = smoothPath(pts)
     const base = r1(bottom)
     if (m > 1) {
@@ -290,10 +277,7 @@ export function tokenChartSvg(requests: readonly AgentRequest[], steps: readonly
       defs.push(`<path id="${id}-l" d="${line}" fill="none" pathLength="1"/>`)
       out.push(`<g${cls('fd')}>`)
       out.push(`<use href="#${id}-a" fill="url(#${id}-f)"/>`)
-      if (over) {
-        out.push(`<use href="#${id}-a" fill="${PALETTE.bad}" fill-opacity="0.18" clip-path="url(#${id}-o)"/>`)
-        out.push(`<use href="#${id}-a" fill="url(#${id}-h)" clip-path="url(#${id}-o)"/>`)
-      }
+      if (over) out.push(`<use href="#${id}-a" fill="${PALETTE.bad}" fill-opacity="0.14" clip-path="url(#${id}-o)"/>`)
       out.push('</g>')
     }
   }
@@ -303,8 +287,9 @@ export function tokenChartSvg(requests: readonly AgentRequest[], steps: readonly
   // The label sits at the left, unless the peak is there too.
   const peakK = idx.reduce((b, i, k) => (requests[i]!.prompt > requests[idx[b]!]!.prompt ? k : b), 0)
   const hitsLeft = requests.length > 0 && xs[peakK]! < plotL + 110
-  out.push(`<line x1="${padL}" x2="${W - padR}" y1="${r1(yB)}" y2="${r1(yB)}" stroke="${PALETTE.bad}" stroke-opacity="0.9" stroke-width="1.3" stroke-dasharray="5 4"/>`)
-  out.push(`<text x="${hitsLeft ? W - padR - 2 : padL + 4}" y="${r1(yB - 5)}" font-size="10" font-weight="600" text-anchor="${hitsLeft ? 'end' : 'start'}" fill="${PALETTE.bad}">${esc(budgetText)}</text>`)
+  const isOver = peakAll > budget
+  out.push(`<line x1="${padL}" x2="${W - padR}" y1="${r1(yB)}" y2="${r1(yB)}" stroke="${PALETTE.bad}" stroke-opacity="0.75" stroke-width="1" stroke-dasharray="4 4"/>`)
+  out.push(`<text x="${hitsLeft ? W - padR - 2 : padL + 4}" y="${r1(isOver ? yB + 13 : yB - 5)}" font-size="10" font-weight="600" text-anchor="${hitsLeft ? 'end' : 'start'}" fill="${PALETTE.bad}">${esc(budgetText)}</text>`)
 
   if (requests.length > 0) {
     // Output bars and tool strip under the plot.
@@ -322,13 +307,14 @@ export function tokenChartSvg(requests: readonly AgentRequest[], steps: readonly
     const strip: string[] = []
     const cols: string[] = []
     const dots: string[] = []
-    const dotR = m <= 24 ? 3.8 : m <= 60 ? 3 : 2
+    const dotR = m <= 24 ? 3 : 2.2
+    const showDots = m <= 40
     const popStep = Math.min(0.035, 0.9 / m)
     idx.forEach((i, k) => {
       const r = requests[i]!
       const x = xs[k]!
       const h = Math.max(1.5, (r.output / maxOut) * outH)
-      bars.push(`<rect${cls('gr', 0.15 + k * popStep * 0.6)} x="${r1(x - barW / 2)}" y="${r1(outBase - h)}" width="${r1(barW)}" height="${r1(h)}" rx="${r1(Math.min(2, barW / 2))}" fill="${PALETTE.output}" fill-opacity="0.8"/>`)
+      bars.push(`<rect${cls('gr', 0.15 + k * popStep * 0.6)} x="${r1(x - barW / 2)}" y="${r1(outBase - h)}" width="${r1(barW)}" height="${r1(h)}" rx="${r1(Math.min(2, barW / 2))}" fill="${PALETTE.output}" fill-opacity="0.55"/>`)
 
       if (k > 0) {
         const prevI = idx[k - 1]!
@@ -361,32 +347,31 @@ export function tokenChartSvg(requests: readonly AgentRequest[], steps: readonly
         }
       }
 
-      const color = levelColor(r.prompt / budget)
+      const color = r.prompt > budget ? PALETTE.bad : ACCENT
       const tip = esc(requestTip(i, r, i > 0 ? requests[i - 1] : undefined))
       const colW = Math.max(2, step)
       cols.push(`<g class="pt"><title>${tip}</title><rect class="col" x="${r1(x - colW / 2)}" y="${r1(top)}" width="${r1(colW)}" height="${r1(stripY + stripH - top)}" fill="${PALETTE.muted}" fill-opacity="0"/></g>`)
-      dots.push(`<circle${cls('pop', 0.9 + k * popStep)} cx="${r1(x)}" cy="${r1(pts[k]![1])}" r="${dotR}" fill="${color}" stroke="#fff" stroke-opacity="${m > 60 ? 0 : 0.8}" stroke-width="${m > 60 ? 0 : 1}" pointer-events="none"/>`)
+      if (showDots) dots.push(`<circle${cls('pop', 0.9 + k * popStep)} cx="${r1(x)}" cy="${r1(pts[k]![1])}" r="${dotR}" fill="${color}" pointer-events="none"/>`)
     })
 
     out.push(...bars, ...strip)
     if (m > 1) {
-      out.push(`<use href="#${id}-l" stroke="url(#${id}-s)" stroke-width="7" stroke-opacity="0.14" stroke-linecap="round" stroke-linejoin="round"${cls('dl')}/>`)
-      if (over) out.push(`<use href="#${id}-l" stroke="${PALETTE.bad}" stroke-width="3.2" stroke-linecap="round" clip-path="url(#${id}-o)"${cls('dl')}/>`)
-      out.push(`<use href="#${id}-l" stroke="url(#${id}-s)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"${cls('dl')}/>`)
+      out.push(`<use href="#${id}-l" stroke="${ACCENT}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"${cls('dl')}/>`)
+      if (over) out.push(`<use href="#${id}-l" stroke="${PALETTE.bad}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#${id}-o)"${cls('dl')}/>`)
     }
     out.push(...dots)
 
     // Peak marker
     const pk = peakK
     const [px, py] = pts[pk]!
-    const peakColor = levelColor(requests[idx[pk]!]!.prompt / budget)
+    const peakColor = requests[idx[pk]!]!.prompt > budget ? PALETTE.bad : ACCENT
     const peakText = `${m === 1 ? '' : 'Peak '}${formatTokens(requests[idx[pk]!]!.prompt)}`
-    const pw = textW(peakText, 10) + 14
+    const pw = textW(peakText, 10) + 16
     const above = py - 26 >= top - 4
     const lx = clamp(above ? px - pw / 2 : px - pw - 9, padL, W - padR - pw)
     const ly = above ? py - 24 : py - 9
     out.push(`<g${cls('fd', 1.5)}>`)
-    out.push(`<circle cx="${r1(px)}" cy="${r1(py)}" r="${dotR + 3.5}" fill="none" stroke="${peakColor}" stroke-width="1.5"/>`)
+    out.push(`<circle cx="${r1(px)}" cy="${r1(py)}" r="4" fill="${peakColor}"/><circle cx="${r1(px)}" cy="${r1(py)}" r="7.5" fill="none" stroke="${peakColor}" stroke-opacity="0.45" stroke-width="1.5"/>`)
     out.push(`<rect x="${r1(lx)}" y="${r1(ly)}" width="${r1(pw)}" height="17" rx="8.5" fill="${peakColor}"/>`)
     out.push(`<text x="${r1(lx + pw / 2)}" y="${r1(ly + 12)}" font-size="10" font-weight="700" text-anchor="middle" fill="#fff">${esc(peakText)}</text>`)
     out.push('</g>')
@@ -396,7 +381,7 @@ export function tokenChartSvg(requests: readonly AgentRequest[], steps: readonly
     // The last point: a pulse while the agent runs.
     if (running) {
       const [lx2, ly2] = pts[m - 1]!
-      const c = levelColor(requests[idx[m - 1]!]!.prompt / budget)
+      const c = requests[idx[m - 1]!]!.prompt > budget ? PALETTE.bad : ACCENT
       out.push(
         animate
           ? `<circle cx="${r1(lx2)}" cy="${r1(ly2)}" r="5" fill="none" stroke="${c}" stroke-width="1.6"><animate attributeName="r" values="4;13" dur="1.6s" repeatCount="indefinite"/><animate attributeName="opacity" values="0.9;0" dur="1.6s" repeatCount="indefinite"/></circle>`
@@ -484,10 +469,10 @@ export function timelineSvg(steps: readonly AgentStep[], opts: TimelineOpts): st
   const want = Math.max(2, Math.floor(plotW / 78))
   const tickS = S.find((s) => total / 1000 / s <= want) ?? 7200
   const axisY = laneBottom + 4
-  out.push(`<line x1="${plotL}" x2="${plotR}" y1="${axisY}" y2="${axisY}" stroke="${PALETTE.muted}" stroke-opacity="0.45"/>`)
+  out.push(`<line x1="${plotL}" x2="${plotR}" y1="${axisY}" y2="${axisY}" stroke="${PALETTE.muted}" stroke-opacity="0.3"/>`)
   for (let t = 0; t * 1000 <= total; t += tickS) {
     const x = px(t * 1000)
-    out.push(`<line x1="${r1(x)}" x2="${r1(x)}" y1="${laneTop - 4}" y2="${axisY + 3}" stroke="${PALETTE.muted}" stroke-opacity="${t === 0 ? 0.3 : 0.14}"/>`)
+    out.push(`<line x1="${r1(x)}" x2="${r1(x)}" y1="${laneTop - 4}" y2="${axisY + 3}" stroke="${PALETTE.muted}" stroke-opacity="${t === 0 ? 0.25 : 0.1}"/>`)
     out.push(`<text x="${r1(x)}" y="${axisY + 14}" font-size="10" text-anchor="${t === 0 ? 'start' : 'middle'}" fill="${PALETTE.label}">${clock(t * 1000)}</text>`)
   }
 
@@ -505,7 +490,7 @@ export function timelineSvg(steps: readonly AgentStep[], opts: TimelineOpts): st
     const ly = laneTop + li * laneH
     const color = PALETTE[kd]
     const mine = steps.filter((s) => kindOf(s.tool) === kd).sort((a, b) => a.at - b.at)
-    if (li % 2 === 0) out.push(`<rect x="6" y="${r1(ly)}" width="${W - 12}" height="${r1(laneH)}" rx="6" fill="${PALETTE.muted}" fill-opacity="0.08"/>`)
+    out.push(`<rect x="4" y="${r1(ly + 1)}" width="${W - 8}" height="${r1(laneH - 2)}" rx="8" fill="${PALETTE.muted}" fill-opacity="0.07"/>`)
     out.push(`<circle cx="17" cy="${r1(ly + laneH / 2)}" r="4" fill="${color}"/>`)
     out.push(`<text x="27" y="${r1(ly + laneH / 2 + 3.8)}" font-size="11" fill="${PALETTE.label}">${KIND_LABELS[kd]}</text>`)
     out.push(`<text x="${padL - 8}" y="${r1(ly + laneH / 2 + 3.5)}" font-size="9.5" text-anchor="end" fill="${PALETTE.label}" fill-opacity="0.75">${mine.length}</text>`)
@@ -523,10 +508,11 @@ export function timelineSvg(steps: readonly AgentStep[], opts: TimelineOpts): st
     const rows = Math.max(1, rowEnds.length)
     const subH = (laneH - 6) / rows
     placed.forEach(({ s, x0, x1, row }) => {
-      const bh = Math.max(4, subH - (rows > 1 ? 2 : 0))
+      // Slim pills, centred in their row: a lane reads as a track, not a block.
+      const bh = clamp(subH - (rows > 1 ? 2 : 0), 4, 10)
       const by = ly + 3 + row * subH + (subH - bh) / 2
       const w = x1 - x0
-      const rx = Math.min(4, bh / 2, w / 2)
+      const rx = Math.min(bh / 2, w / 2)
       const delay = order * Math.min(0.04, 1.2 / steps.length)
       order++
       const failed = s.isError
@@ -565,39 +551,54 @@ export function timelineSvg(steps: readonly AgentStep[], opts: TimelineOpts): st
 }
 
 // ---------------------------------------------------------------------------
-// Budget ring
+// Budget meter
 
-export type RingOpts = { size: number; animate?: boolean }
+export type MeterOpts = { width: number; animate?: boolean }
 
-export function budgetRingSvg(peak: number, budget: number, opts: RingOpts): string {
-  const s = Math.max(40, Math.round(opts.size))
+// A slim bar of peak context against the budget. Past the budget the track
+// stretches to the peak and a tick marks where the budget ends.
+export function budgetMeterSvg(peak: number, budget: number, opts: MeterOpts): string {
+  const W = Math.max(40, Math.round(opts.width))
+  const H = 10
   const animate = opts.animate ?? true
   const frac = budget > 0 ? Math.max(0, peak) / budget : 0
-  const pct = clamp(frac * 100, 0, 100)
   const color = levelColor(frac)
-  const sw = Math.max(5, s * 0.1)
-  const c = s / 2
-  const r = (s - sw * 1.6) / 2 - 1
+  const scale = Math.max(budget, peak, 1)
+  const fill = clamp((Math.max(0, peak) / scale) * W, peak > 0 ? 4 : 0, W)
+  const tick = (budget / scale) * W
   const label = `Peak context ${formatTokens(peak)} of ${formatTokens(budget)} (${Math.round(frac * 100)}%)`
-  const arc = (extra: string, w: number, op: number): string =>
-    `<circle cx="${r1(c)}" cy="${r1(c)}" r="${r1(r)}" fill="none" stroke="${color}" stroke-width="${r1(w)}" stroke-opacity="${op}" stroke-linecap="round" pathLength="100" stroke-dasharray="${r1(pct)} 100" transform="rotate(-90 ${r1(c)} ${r1(c)})"${extra}/>`
-  const cls = animate ? ' class="sweep"' : ''
-  const big = clamp(s * 0.25, 12, 44)
-  const small = clamp(s * 0.105, 8, 14)
   const parts = [
-    `<circle cx="${r1(c)}" cy="${r1(c)}" r="${r1(r)}" fill="none" stroke="${PALETTE.muted}" stroke-opacity="0.22" stroke-width="${r1(sw)}"/>`,
-    pct > 0 ? arc(cls, sw * 1.5, 0.13) : '',
-    pct > 0 ? arc(cls, sw, 1) : '',
-    // The budget mark at twelve o'clock.
-    `<line x1="${r1(c)}" x2="${r1(c)}" y1="${r1(c - r - sw / 2 - 1)}" y2="${r1(c - r + sw / 2 + 1)}" stroke="${PALETTE.label}" stroke-opacity="0.8" stroke-width="1.5" stroke-linecap="round"/>`,
-    `<text x="${r1(c)}" y="${r1(c + big * 0.2)}" font-size="${r1(big)}" font-weight="700" text-anchor="middle" fill="${color}">${esc(formatTokens(peak))}</text>`,
-    `<text x="${r1(c)}" y="${r1(c + big * 0.2 + small + 3)}" font-size="${r1(small)}" text-anchor="middle" fill="${PALETTE.label}">of ${esc(formatTokens(budget))}</text>`,
-    s >= 96 ? `<text x="${r1(c)}" y="${r1(c - big * 0.8)}" font-size="${r1(small)}" font-weight="600" text-anchor="middle" fill="${color}">${Math.round(frac * 100)}%</text>` : '',
+    `<rect x="0" y="2" width="${W}" height="6" rx="3" fill="${PALETTE.muted}" fill-opacity="0.22"/>`,
+    fill > 0 ? `<rect${animate ? ' class="grow"' : ''} x="0" y="2" width="${r1(fill)}" height="6" rx="3" fill="${color}"/>` : '',
+    frac > 1 ? `<rect x="${r1(clamp(tick - 1, 0, W - 2))}" y="0" width="2" height="${H}" rx="1" fill="${PALETTE.label}"/>` : '',
   ]
   const style = animate
-    ? '.sweep{animation:br-sweep 1.2s cubic-bezier(.3,.7,.2,1) both}@keyframes br-sweep{from{stroke-dasharray:0 100}}@media (prefers-reduced-motion:reduce){.sweep{animation:none}}'
+    ? '.grow{transform-box:fill-box;transform-origin:0 50%;animation:bm-grow .9s cubic-bezier(.3,.7,.2,1) both}@keyframes bm-grow{from{transform:scaleX(0)}}@media (prefers-reduced-motion:reduce){.grow{animation:none}}'
     : ''
-  return `${svgOpen(s, s, label)}<title>${esc(label)}</title><style>${style}</style>${parts.join('')}</svg>`
+  return `${svgOpen(W, H, label)}<title>${esc(label)}</title><style>${style}</style>${parts.join('')}</svg>`
+}
+
+// ---------------------------------------------------------------------------
+// Tool mix bar
+
+// `shade` tells apart tools that share a color: 0 full, 1 lighter, 2 lighter still.
+export type MixSegment = { name: string; count: number; color: string; shade?: number }
+
+// One rounded bar split by share, a hairline gap between segments.
+export function mixBarSvg(segments: readonly MixSegment[], opts: { width: number }): string {
+  const W = Math.max(40, Math.round(opts.width))
+  const H = 8
+  const total = segments.reduce((sum, s) => sum + Math.max(0, s.count), 0)
+  const label = `Tool mix: ${segments.map((s) => `${s.name} ${s.count}`).join(', ')}`
+  const rects: string[] = []
+  let x = 0
+  for (const s of segments) {
+    if (total === 0 || s.count <= 0) continue
+    const w = (s.count / total) * W
+    rects.push(`<rect x="${r1(x)}" y="0" width="${r1(Math.max(1, w - 2))}" height="${H}" fill="${s.color}" fill-opacity="${[1, 0.6, 0.35][s.shade ?? 0] ?? 1}"><title>${esc(`${s.name} ${s.count}`)}</title></rect>`)
+    x += w
+  }
+  return `${svgOpen(W, H, label)}<title>${esc(label)}</title><defs><clipPath id="mx"><rect width="${W}" height="${H}" rx="4"/></clipPath></defs><g clip-path="url(#mx)">${rects.join('')}</g></svg>`
 }
 
 // ---------------------------------------------------------------------------

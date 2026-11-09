@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { AgentRequest, AgentStep } from '../types'
-import { budgetBar, budgetRingSvg, formatTokens, kindOf, PALETTE, sparkline, statusOrbSvg, timelineHeight, timelineSvg, tokenChartSvg } from './visuals'
+import { budgetBar, budgetMeterSvg, formatTokens, kindOf, mixBarSvg, PALETTE, sparkline, statusOrbSvg, timelineHeight, timelineSvg, tokenChartSvg } from './visuals'
 import type { OrbState } from './visuals'
 
 const LIMIT = 131_072
@@ -151,18 +151,36 @@ test('control characters in a target never reach the SVG', () => {
   checkSvg(svg)
 })
 
-test('budgetRingSvg shows the peak, the budget and a color by fill level', () => {
-  const low = budgetRingSvg(48_000, 150_000, { size: 120 })
+test('budgetMeterSvg fills by the peak, colors by fill level, and marks the budget once past it', () => {
+  const low = budgetMeterSvg(48_000, 150_000, { width: 160 })
   checkSvg(low)
-  expect(low).toContain('>48K</text>')
-  expect(low).toContain('>of 150K</text>')
   expect(low).toContain(PALETTE.good)
-  expect(budgetRingSvg(130_000, 150_000, { size: 120 })).toContain(PALETTE.warn)
-  const over = budgetRingSvg(180_000, 150_000, { size: 120, animate: false })
+  expect(low).toContain('Peak context 48K of 150K (32%)')
+  expect(budgetMeterSvg(130_000, 150_000, { width: 160 })).toContain(PALETTE.warn)
+  const over = budgetMeterSvg(180_000, 150_000, { width: 180, animate: false })
+  checkSvg(over)
   expect(over).toContain(PALETTE.bad)
+  // The budget tick sits at 150 of 180: x = 150 - 1.
+  expect(over).toContain('<rect x="149" y="0" width="2"')
   expect(over).not.toContain('animation')
-  checkSvg(budgetRingSvg(0, 150_000, { size: 120 }))
-  checkSvg(budgetRingSvg(10, 0, { size: 60 }))
+  checkSvg(budgetMeterSvg(0, 150_000, { width: 120 }))
+  checkSvg(budgetMeterSvg(10, 0, { width: 60 }))
+})
+
+test('mixBarSvg splits one bar by share and shades tools that share a color', () => {
+  const svg = mixBarSvg(
+    [
+      { name: 'Read', count: 6, color: PALETTE.explore },
+      { name: 'Gr<ep', count: 3, color: PALETTE.explore, shade: 1 },
+      { name: 'Bash', count: 1, color: PALETTE.run },
+    ],
+    { width: 200 },
+  )
+  checkSvg(svg)
+  expect(svg).toContain('width="118"')
+  expect(svg).toContain('fill-opacity="0.6"')
+  expect(svg).toContain('Gr&lt;ep 3')
+  checkSvg(mixBarSvg([], { width: 100 }))
 })
 
 test('statusOrbSvg draws every state', () => {

@@ -645,10 +645,17 @@ test('the tool mix is one stacked bar with a legend, and tools of one color take
     expect(await pane.find({ type: 'Text', text: /^■ Read 6$/ })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: /^▓ Grep 3$/ })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: /^■ Bash 1$/ })).toBeDefined()
-    // Its bar spans at most 40 cells, in proportion: 6 of 10 calls take 24.
-    expect(await pane.find({ type: 'Text', text: /^█{24}$/ })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: /^▓{12}$/ })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: /^█{4}$/ })).toBeDefined()
+    if (surface === 'desktop') {
+      // Desktop draws the bar; Grep takes a lighter shade of the color it shares with Read.
+      const bar = (await pane.findAll({ type: 'Svg' })).find(s => String(s.props.alt).startsWith('Tool mix'))
+      expect(bar?.props.alt).toBe('Tool mix: Read 6, Grep 3, Bash 1')
+      expect(String(bar?.props.source)).toContain('fill-opacity="0.6"')
+    } else {
+      // Its bar spans at most 40 cells, in proportion: 6 of 10 calls take 24.
+      expect(await pane.find({ type: 'Text', text: /^█{24}$/ })).toBeDefined()
+      expect(await pane.find({ type: 'Text', text: /^▓{12}$/ })).toBeDefined()
+      expect(await pane.find({ type: 'Text', text: /^█{4}$/ })).toBeDefined()
+    }
     await pane.unmount()
   }
 })
@@ -691,8 +698,10 @@ test('more tools than the bar has cells fold the smallest into one other segment
   for (const surface of SURFACES) {
     // 20 columns leave 16 cells: 15 tools and the rest as "other".
     const pane = await showAgent($, 'agent-1', surface, 20)
-    const cells = (await pane.findAll({ type: 'Text', text: /^[█▓▒░]+$/ })).reduce((sum, t) => sum + String(t.text).length, 0)
-    expect(cells).toBe(16)
+    if (surface === 'terminal') {
+      const cells = (await pane.findAll({ type: 'Text', text: /^[█▓▒░]+$/ })).reduce((sum, t) => sum + String(t.text).length, 0)
+      expect(cells).toBe(16)
+    }
     expect(await pane.find({ type: 'Text', text: /other 5$/ })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: /mcp__t__a16 1/ })).toBeUndefined()
     await pane.unmount()
@@ -976,7 +985,9 @@ test('the tab bar counts what each tab holds, switches on a press, and marks the
   for (const surface of SURFACES) {
     const pane = await showFirst($, surface)
     const labels = async () => Object.fromEntries(await Promise.all(['overview', 'brief', 'steps', 'tokens', 'report'].map(async t => [t, String((await pane.find({ key: `orchestrator-tab-${t}` }))?.props.label).trim()])))
-    expect(await labels()).toEqual({ overview: 'Overview', brief: 'Brief', steps: 'Steps 4', tokens: 'Tokens 160K', report: 'Report ✓' })
+    // Desktop keeps the labels short so the five fit one row.
+    if (surface === 'desktop') expect(await labels()).toEqual({ overview: 'Overview', brief: 'Brief', steps: 'Steps', tokens: 'Tokens', report: 'Report' })
+    else expect(await labels()).toEqual({ overview: 'Overview', brief: 'Brief', steps: 'Steps 4', tokens: 'Tokens 160K', report: 'Report ✓' })
     if (surface === 'desktop') expect((await pane.find({ key: 'orchestrator-tab-overview' }))?.props.variant).toBe('primary')
     else expect(await pane.find({ type: 'Text', text: ' Overview '})).toBeDefined()
     expect((await pane.find({ key: 'orchestrator-tab-brief' }))?.props.hotkey).toBe('2')
@@ -1071,16 +1082,17 @@ test('a step opens to its input and output, closes on a second press, and says w
     expect((await pane.find({ key: 'orchestrator-step-1' }))?.props.label).toMatch(/^▸ ✓ +0:02 Read +src\/big\.ts$/)
     expect((await pane.find({ key: 'orchestrator-step-3' }))?.props.label).toMatch(/^▸ ✗ .* Bash +false$/)
     if (surface === 'desktop') expect((await svgAlts(pane)).some(a => /^Timeline of 4 tool calls/.test(a))).toBe(true)
-    expect(await pane.find({ type: 'Code' })).toBeUndefined()
+    // Input and output are wrapped text in the pane, never a Code block that scrolls inside itself.
+    const input = () => pane.find({ type: 'Text', text: /^\{[\s\S]*\}$/ })
+    expect(await input()).toBeUndefined()
 
     await pane.press({ key: 'orchestrator-step-1' })
     expect((await pane.find({ key: 'orchestrator-step-1' }))?.props.label).toMatch(/^▾ /)
-    const input = await pane.find({ type: 'Code' })
-    expect(input?.props.language).toBe('json')
-    expect(JSON.parse(String(input?.props.source))).toEqual({ file_path: '/repo/src/big.ts' })
+    expect(await pane.find({ type: 'Code' })).toBeUndefined()
+    expect(JSON.parse(String((await input())?.text))).toEqual({ file_path: '/repo/src/big.ts' })
     expect(await pane.find({ type: 'Text', text: 'Input' })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: 'Output' })).toBeDefined()
-    expect(await pane.find({ type: 'Code', text: 'x'.repeat(200) })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'x'.repeat(200) })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: '#1 Read' })).toBeDefined()
 
     // Another press opens that one instead; the failed one marks its output.
@@ -1088,9 +1100,9 @@ test('a step opens to its input and output, closes on a second press, and says w
     expect(await pane.find({ type: 'Text', text: '#1 Read' })).toBeUndefined()
     expect(await pane.find({ type: 'Text', text: '#3 Bash' })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: ' FAILED ' })).toBeDefined()
-    expect(JSON.parse(String((await pane.find({ type: 'Code' }))?.props.source))).toEqual({ command: 'false' })
+    expect(JSON.parse(String((await input())?.text))).toEqual({ command: 'false' })
     await pane.press({ key: 'orchestrator-step-3' })
-    expect(await pane.find({ type: 'Code' })).toBeUndefined()
+    expect(await input()).toBeUndefined()
     await pane.unmount()
   }
 })
@@ -1118,7 +1130,7 @@ test('a step an older agent kept has no input to show, and another agent starts 
     // The step open on one agent is not open on the next.
     const other = await showAgent($, 'agent-16', surface, 80, 'steps')
     expect((await other.find({ key: 'orchestrator-step-1' }))?.props.label).toMatch(/^▸ /)
-    expect(await other.find({ type: 'Code' })).toBeUndefined()
+    expect(await other.find({ type: 'Text', text: /^\{[\s\S]*\}$/ })).toBeUndefined()
     await other.unmount()
   }
 })
@@ -1154,6 +1166,40 @@ test('the tokens tab shows how the context grew: the chart, the numbers, the big
     else await text(/^[▁▂▃▄▅▆▇█]+$/)
     await pane.unmount()
   }
+})
+
+// The engine draws the pane again on every scroll step: a chart whose source changed is
+// a new frame on desktop, which reloads, flickers and moves the pane under the wheel.
+async function chartsHold($: Engine, seen: ReturnType<typeof engine>, tabs: string[]) {
+  const sources = async (tab: string) => {
+    const pane = await showAgent($, 'agent-1', 'desktop', 80, tab)
+    const all = (await pane.findAll({ type: 'Svg' })).map(s => String(s.props.source))
+    await pane.unmount()
+    return all
+  }
+  for (const tab of tabs) {
+    const before = await sources(tab)
+    expect(before.length).toBeGreaterThan(0)
+    // No chart animates in: a redraw would play it again.
+    for (const svg of before) expect(svg).not.toContain('@keyframes')
+    await seen.clock.advance(1_000)
+    expect(await sources(tab)).toEqual(before)
+  }
+}
+
+test('a redraw of a running agent keeps its charts the same, though the clock moved', async ($, on) => {
+  const seen = engine(on)
+  await run($, 'on')
+  await spawn($, 'orchestrator:scout', { name: 'scout-live' })
+  await $.tool.call({ tool: 'Bash', command: 'sleep 1', agentId: 'agent-1' } as never)
+  await openList($)
+  await chartsHold($, seen, ['overview', 'steps'])
+})
+
+test('a redraw of a finished agent keeps every chart the same', async ($, on) => {
+  const seen = engine(on)
+  await seedInspector($, seen)
+  await chartsHold($, seen, ['overview', 'steps', 'tokens'])
 })
 
 test('an agent with no steps, requests or report says so on every tab, on every surface', async ($, on) => {
@@ -1193,11 +1239,14 @@ test('the report tab splits the report, puts open points first when partial, and
     const order = (await pane.findAll({ type: 'Text', text: /^(✎ Changes|⌕ Evidence|⚑ Open questions & risks)$/ })).map(t => t.text)
     expect(order).toEqual(['✎ Changes', '⚑ Open questions & risks', '⌕ Evidence'])
     expect(await pane.find({ type: 'Text', text: 'reported partial' })).toBeUndefined()
+    // The raw report is wrapped text in the pane: a Code block scrolled inside itself and kept the wheel.
+    const raw = () => pane.find({ type: 'Text', text: /^STATUS: partial\nANSWER: half of it/ })
+    expect(await raw()).toBeUndefined()
+    await pane.press({ key: 'orchestrator-report-raw' })
+    expect(await raw()).toBeDefined()
     expect(await pane.find({ type: 'Code' })).toBeUndefined()
     await pane.press({ key: 'orchestrator-report-raw' })
-    expect(await pane.find({ type: 'Code', text: /^STATUS: partial\nANSWER: half of it/ })).toBeDefined()
-    await pane.press({ key: 'orchestrator-report-raw' })
-    expect(await pane.find({ type: 'Code' })).toBeUndefined()
+    expect(await raw()).toBeUndefined()
     await pane.unmount()
   }
 })
@@ -1215,7 +1264,7 @@ test('control characters never reach the pane: a step with coloured output opens
     const pane = await showAgent($, 'agent-1', surface, 80, 'steps')
     // The open step outlives a mount: open it only when it is shut.
     if (String((await pane.find({ key: 'orchestrator-step-1' }))?.props.label).startsWith('▸')) await pane.press({ key: 'orchestrator-step-1' })
-    expect(await pane.find({ type: 'Code', text: 'red' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'red' })).toBeDefined()
     await pane.unmount()
   }
 })

@@ -18,7 +18,7 @@
     {
       "name": "orchestrator",
       "source": "./orchestrator",
-      "description": "Turns a session into an orchestrator that delegates work to Haiku 5.5 and Sonnet 5.5 subagents, keeps its own context small, and lists the running and past agents in an expandable band whose rows open a tabbed agent inspector: the outcome at a glance, the whole brief in cards, every step with its input and output, and a token view of how the agent's context grew, with charts and animation on desktop (/orchestrator on|off|status)"
+      "description": "Turns a session into an orchestrator that delegates work to Haiku 5.5 and Sonnet 5.5 subagents, keeps its own context small, and lists the running and past agents in an expandable band whose rows open a tabbed agent inspector: the outcome at a glance, the whole brief in cards, every step with its input and output, and a token view of how the agent's context grew, with charts on desktop (/orchestrator on|off|status)"
     }
   ]
 }
