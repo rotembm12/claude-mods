@@ -1,6 +1,7 @@
 // Visuals for the agent details pane: pure functions that return SVG source (for the
-// desktop `Svg` element, drawn in a script-less frame where SMIL, <style> animations,
-// :hover and <title> tooltips work) and plain-text twins for the terminal.
+// desktop `Svg` element, drawn as an image so the pane keeps the scroll wheel; the
+// :hover styles and <title> tips only show where a surface draws it interactive) and
+// plain-text twins for the terminal.
 //
 //   tokenChartSvg(requests, steps, opts)  context growth per request: area chart, budget line,
 //                                         peak marker, output bars, a strip colored by tool kind
