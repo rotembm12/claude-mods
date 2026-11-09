@@ -145,8 +145,11 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
 
   // ---- Small pieces
 
+  // A chart is drawn as an image, never `isInteractive`: that draws it in a frame of its
+  // own, and a frame takes the wheel, so the pane would not scroll while the pointer is
+  // over a chart. The cost is the charts' hover tooltips.
   const draw = (source: string, alt: string, size?: number) =>
-    Svg === null ? null : <Svg source={source} alt={alt} isInteractive {...(size !== undefined ? { width: size, height: size } : {})} />
+    Svg === null ? null : <Svg source={source} alt={alt} {...(size !== undefined ? { width: size, height: size } : {})} />
   const chip = (label: string, color: string) => (
     <Text backgroundColor={color} color={CHIP_TEXT} bold size="caption">
       {` ${label.toUpperCase()} `}

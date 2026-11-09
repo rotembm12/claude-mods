@@ -1029,8 +1029,10 @@ test('the overview says who the agent is, the outcome and its numbers, with char
       expect(alts).toContain('Peak context 160K of 150K, 107%')
       expect(alts).toContain('Context per request: 4 requests, peak 160K of 150K, now 160K')
       expect(alts.some(a => /^Timeline of 4 tool calls/.test(a))).toBe(true)
+      // An interactive Svg is a frame of its own, which takes the wheel: the pane would
+      // not scroll while the pointer is over a chart.
       for (const svg of await pane.findAll({ type: 'Svg' })) {
-        expect(svg.props.isInteractive).toBe(true)
+        expect(svg.props.isInteractive).toBeUndefined()
         expect(String(svg.props.source).startsWith('<svg')).toBe(true)
       }
     } else {
