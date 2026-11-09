@@ -1,7 +1,8 @@
 // The agent inspector: the details pane of one agent, in five tabs. A hero says who the
 // agent is and where it stands; the tab bar picks what to read: the outcome at a glance, the
 // whole brief in cards, every step with its input and output, how the context grew, and the
-// report. Desktop draws the charts as animated SVG; the terminal draws their text twins.
+// report. Desktop draws each section as a card and the charts as still SVG (the engine
+// draws the pane again on every scroll step); the terminal draws their text twins.
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, RenderInput } from 'claude-code'
 
@@ -33,7 +34,7 @@ import {
   typeOf,
 } from './format'
 import type { BriefSection, Phase } from './format'
-import { budgetBar, budgetRingSvg, formatTokens, kindOf, ORB_COLORS, PALETTE, sparkline, statusOrbSvg, timelineHeight, timelineSvg, tokenChartSvg } from './visuals'
+import { budgetBar, budgetMeterSvg, formatTokens, kindOf, mixBarSvg, ORB_COLORS, PALETTE, sparkline, statusOrbSvg, timelineHeight, timelineSvg, tokenChartSvg } from './visuals'
 import type { OrbState } from './visuals'
 
 // An atom is declared in the module that reads it: these are the keys register.tsx writes.
@@ -56,8 +57,16 @@ const BAR_CELLS = 40
 const PHASE_LINES = 3
 // The phases the Overview shows.
 const SHOWN_PHASES = 10
-// A cell of the pane in pixels, about: what an SVG's width is sized from.
-const CELL_PX = 7.4
+// A cell of the desktop pane in CSS pixels, about: what an SVG's width is sized from, so
+// the drawing is near its slot's width and its text is drawn near its own size.
+const CELL_PX = 9.6
+// The engine draws the pane again on every scroll step. A chart whose source changes
+// between two draws is a new frame on desktop: it reloads and flickers, and the pane's
+// height jumps under the wheel. So the charts never animate in, and the clock they read
+// moves in steps of this many milliseconds, not on every draw.
+const CHART_TICK = 10_000
+// What a section card's border and padding take, in cells.
+const CARD_CELLS = 6
 // Text on a colored chip: dark, which holds on every mid-tone of the palette.
 const CHIP_TEXT = '#111827'
 
@@ -92,11 +101,12 @@ function toneOf(word: string, status: AgentRun['status']): string {
 const orbOf = (word: string, status: AgentRun['status']): OrbState =>
   word in ORB_COLORS ? (word as OrbState) : status === 'running' ? 'running' : status === 'completed' ? 'done' : status === 'failed' ? 'failed' : 'killed'
 
-type Stat = { value: string; what: string; color: string }
+// `alert` colors the value on desktop too; otherwise only the terminal colors it.
+type Stat = { value: string; what: string; color: string; alert?: boolean }
 
 export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
   const ui = $.ui.resolve(e)
-  const { Box, Button, Code, Markdown, Text } = ui
+  const { Box, Button, Markdown, Text } = ui
   const Svg = 'Svg' in ui ? ui.Svg : null
   const id = await read($, selected)
   const runs: AgentRun[] = await read($, agents)
@@ -111,11 +121,12 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
   const isRaw = await read($, showRawReport)
 
   const now = await $.clock.now()
+  const chartNow = Math.floor(now / CHART_TICK) * CHART_TICK
   const isTerminal = e.surface === 'terminal'
   // A card's border and padding take four columns.
   const columns = Math.max(16, e.props.bodyColumns)
   const width = columns - 4
-  const svgWidth = Math.min(960, Math.max(320, Math.round(columns * CELL_PX)))
+  const svgWidth = Math.min(960, Math.max(280, Math.round((columns - CARD_CELLS) * CELL_PX)))
   const [glyph] = GLYPHS[run.status]
   const word = stateOf(run)
   const tone = toneOf(word, run.status)
@@ -137,19 +148,53 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
   const draw = (source: string, alt: string, size?: number) =>
     Svg === null ? null : <Svg source={source} alt={alt} isInteractive {...(size !== undefined ? { width: size, height: size } : {})} />
   const chip = (label: string, color: string) => (
-    <Text backgroundColor={color} color={CHIP_TEXT} bold>
+    <Text backgroundColor={color} color={CHIP_TEXT} bold size="caption">
       {` ${label.toUpperCase()} `}
     </Text>
   )
   const heading = (title: string, accent: string, aside?: string) => (
-    <Box marginTop={isTerminal ? 1 : 2}>
+    <Box marginTop={1}>
       <Text color={accent} bold>
         {'▍'}
       </Text>
-      <Text bold size="heading">
-        {isTerminal ? title.toUpperCase() : title}
+      <Text bold>{title.toUpperCase()}</Text>
+      {aside !== undefined && <Text dimColor>{`  ${aside}`}</Text>}
+    </Box>
+  )
+  // A section: on the terminal a heading over its rows; on desktop a card with one quiet
+  // border, its title and an aside on top, so the pane reads as a stack of solid blocks.
+  const section = (key: string, title: string, accent: string, aside: string | undefined, children: (JSX.Element | null | false)[], titleColor?: string) =>
+    isTerminal ? (
+      <Box key={key} flexDirection="column">
+        {heading(title, accent, aside)}
+        {children}
+      </Box>
+    ) : (
+      <Box key={key} flexDirection="column" marginTop={1} borderStyle="round" borderDimColor paddingX={2} paddingY={1}>
+        <Box justifyContent="space-between" alignItems="center" columnGap={2} flexWrap="wrap">
+          <Text weight="semibold" size="heading" color={titleColor}>
+            {title}
+          </Text>
+          {aside !== undefined && (
+            <Box flexShrink={1}>
+              <Text dimColor size="footnote">
+                {aside}
+              </Text>
+            </Box>
+          )}
+        </Box>
+        <Box flexDirection="column" marginTop={1}>
+          {children}
+        </Box>
+      </Box>
+    )
+  // Text that may run long, wrapped in the pane rather than held in a box of its own:
+  // a Code block scrolls inside itself and, once it fills the view, keeps the wheel.
+  const longText = (key: string, text: string, isError = false) => (
+    <Box key={key} borderStyle="round" borderDimColor={!isError} borderColor={isError ? PALETTE.error : undefined} paddingX={1}>
+      <Text mono wrap="wrap" size="footnote">
+        {text}
       </Text>
-      {aside !== undefined && <Text dimColor size="footnote">{`  ${aside}`}</Text>}
     </Box>
   )
   const label = (title: string, color?: string) => (
@@ -196,25 +241,40 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
     { value: timeOf(run, now), what: isRunning ? 'so far' : 'run time', color: PALETTE.now },
     { value: String(run.tools), what: run.tools === 1 ? 'tool call' : 'tool calls', color: PALETTE.explore },
     ...(edited.length > 0 ? [{ value: String(edited.length), what: edited.length === 1 ? 'file edited' : 'files edited', color: PALETTE.edit }] : []),
-    ...(failedCalls > 0 ? [{ value: String(failedCalls), what: failedCalls === 1 ? 'failed call' : 'failed calls', color: PALETTE.error }] : []),
+    ...(failedCalls > 0 ? [{ value: String(failedCalls), what: failedCalls === 1 ? 'failed call' : 'failed calls', color: PALETTE.error, alert: true }] : []),
   ]
-  const tokensTile = hasTokens ? (
-    <Box key="orchestrator-tile-tokens" flexDirection="column" alignItems="center" borderStyle="round" borderColor={levelColor(peakFrac)} paddingX={1}>
-      {draw(budgetRingSvg(stats.peak, BUDGET, { size: 84, animate: true }), `Peak context ${formatTokens(stats.peak)} of ${formatTokens(BUDGET)}, ${percent(peakFrac)}`, 84)}
+  // A desktop tile: the caption on top, the number under it, both in the pane's own colors
+  // unless the number is a warning. Tiles grow to share each row evenly.
+  const tile = (key: string, caption: string, value: string, color?: string, extra?: JSX.Element | null) => (
+    <Box key={key} flexDirection="column" flexGrow={1} minWidth={13} borderStyle="round" borderDimColor paddingX={1}>
       <Text size="caption" dimColor>
-        peak context
+        {caption}
       </Text>
-    </Box>
-  ) : (
-    <Box key="orchestrator-tile-tokens" flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
-      <Text size="title" bold>
-        —
+      <Text size="title" weight="semibold" tabular color={color}>
+        {value}
       </Text>
-      <Text size="caption" dimColor>
-        context not recorded
-      </Text>
+      {extra}
     </Box>
   )
+  const tileGrid = (rows: Stat[], lead?: JSX.Element) => (
+    <Box marginTop={1} flexWrap="wrap" gap={1}>
+      {lead}
+      {rows.map(t => tile(`orchestrator-stat-${t.what}`, t.what, t.value, t.alert === true ? t.color : undefined))}
+    </Box>
+  )
+  const meterWidth = Math.max(80, Math.min(220, Math.round((columns / 3) * CELL_PX)))
+  const tokensTile = hasTokens
+    ? tile(
+        'orchestrator-tile-tokens',
+        'peak context',
+        formatTokens(stats.peak),
+        peakFrac >= 0.75 ? levelColor(peakFrac) : undefined,
+        <Box flexDirection="column" marginTop={1}>
+          {draw(budgetMeterSvg(stats.peak, BUDGET, { width: meterWidth, animate: false }), `Peak context ${formatTokens(stats.peak)} of ${formatTokens(BUDGET)}, ${percent(peakFrac)}`)}
+          <Text size="caption" dimColor tabular>{`${percent(peakFrac)} of ${formatTokens(BUDGET)} budget`}</Text>
+        </Box>,
+      )
+    : tile('orchestrator-tile-tokens', 'context not recorded', '—')
   const statRow = isTerminal ? (
     <Box flexDirection="column" marginTop={1}>
       {hasTokens && (
@@ -238,35 +298,38 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
       </Box>
     </Box>
   ) : (
-    <Box marginTop={1} flexWrap="wrap" gap={1} alignItems="center">
-      {tokensTile}
-      {tiles.map(t => (
-        <Box key={`orchestrator-stat-${t.what}`} flexDirection="column" borderStyle="round" borderColor={t.color} paddingX={1}>
-          <Text size="title" bold tabular>
-            {t.value}
-          </Text>
-          <Text size="caption" dimColor>
-            {t.what}
-          </Text>
-        </Box>
-      ))}
-    </Box>
+    tileGrid(tiles, tokensTile)
   )
-  const hero = (
+  const hero = isTerminal ? (
     <Box flexDirection="column" borderStyle="round" borderColor={tone} paddingX={1}>
       <Box gap={1} alignItems="center">
-        {isTerminal ? <Text color={tone} bold>{`${glyph} `}</Text> : draw(statusOrbSvg(orbOf(word, run.status), { size: 44, animate: true }), `Agent ${word}`, 44)}
+        <Text color={tone} bold>{`${glyph} `}</Text>
         <Box flexDirection="column" flexShrink={1}>
           <Box justifyContent="space-between" gap={1}>
             <Box flexShrink={1}>
-              <Text bold size="title">
-                {labelOf(run)}
-              </Text>
+              <Text bold>{labelOf(run)}</Text>
             </Box>
             {chip(word, tone)}
           </Box>
           {run.name !== null && <Text>{run.description}</Text>}
           {meta}
+        </Box>
+      </Box>
+      {statRow}
+    </Box>
+  ) : (
+    <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={2} paddingY={1}>
+      <Box gap={2} alignItems="center">
+        {draw(statusOrbSvg(orbOf(word, run.status), { size: 36, animate: true }), `Agent ${word}`, 36)}
+        <Box flexDirection="column" flexShrink={1} flexGrow={1}>
+          <Text weight="semibold" size="title">
+            {labelOf(run)}
+          </Text>
+          {run.name !== null && <Text dimColor>{run.description}</Text>}
+          <Box marginTop={1} columnGap={1} alignItems="center" flexWrap="wrap">
+            {chip(word, tone)}
+            {meta}
+          </Box>
         </Box>
       </Box>
       {statRow}
@@ -280,7 +343,8 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
   const tabBar = (
     <Box marginTop={1} flexWrap="wrap" gap={isTerminal ? 1 : undefined}>
       {TAB_LABELS.map(([t, name], i) => {
-        const text = `${name}${countOf(t)}`
+        // Desktop keeps the labels short so the five fit one row; the numbers are in the tiles.
+        const text = isTerminal ? `${name}${countOf(t)}` : name
         const press = () => update($, tab, () => t)
         const key = `orchestrator-tab-${t}`
         return isTerminal ? (
@@ -302,14 +366,20 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
 
   // ---- The outcome: the report by the contract's fields
 
-  const answerBox = (caption: string, body: JSX.Element | (JSX.Element | false)[]) => (
-    <Box flexDirection="column" borderStyle="round" borderColor={tone} paddingX={1}>
-      <Text dimColor size="caption">
-        {caption}
-      </Text>
-      {body}
-    </Box>
-  )
+  const answerBox = (caption: string, body: JSX.Element | (JSX.Element | false)[]) =>
+    isTerminal ? (
+      <Box flexDirection="column" borderStyle="round" borderColor={tone} paddingX={1}>
+        <Text dimColor>{caption}</Text>
+        {body}
+      </Box>
+    ) : (
+      <Box flexDirection="column">
+        <Text dimColor size="caption" weight="medium">
+          {caption}
+        </Text>
+        {body}
+      </Box>
+    )
   const working = (
     <Box flexDirection="column">
       <Text color={PALETTE.now}>● Working</Text>
@@ -428,7 +498,16 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
     seenColors[color] = turn + 1
     return turn % FILLS.length
   })
-  const toolMix = (
+  const toolMix = !isTerminal ? (
+    <Box flexDirection="column">
+      {draw(mixBarSvg(segments.map(([tool, n], i) => ({ name: tool, count: n, color: kindColor(tool), shade: fills[i] })), { width: svgWidth }), `Tool mix: ${segments.map(([tool, n]) => `${tool} ${n}`).join(', ')}`)}
+      <Box marginTop={1} flexWrap="wrap" columnGap={2}>
+        {segments.map(([tool, n], i) => (
+          <Text key={`orchestrator-legend-${tool}`} mono size="footnote" color={kindColor(tool)}>{clip(`${SWATCHES[fills[i] as number]} ${tool} ${n}`, width)}</Text>
+        ))}
+      </Box>
+    </Box>
+  ) : (
     <Box flexDirection="column">
       <Box>
         {segments.map(([tool], i) => (
@@ -456,14 +535,14 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
     steps.length === 0
       ? null
       : draw(
-          timelineSvg(steps, { width: svgWidth, height: timelineHeight(steps), totalMs: isRunning ? now - run.startedAt : undefined, isRunning, animate: true }),
+          timelineSvg(steps, { width: svgWidth, height: timelineHeight(steps), totalMs: isRunning ? chartNow - run.startedAt : undefined, isRunning, animate: false }),
           `Timeline of ${steps.length} tool calls over ${duration(Math.max(run.runMs, (latest?.at ?? 0) + (latest?.ms ?? 0)))}, one lane per kind of tool`,
         )
   const contextBars = (compact: boolean): JSX.Element | null => {
     if (!hasTokens) return null
     if (!isTerminal)
       return draw(
-        tokenChartSvg(requests, steps, { width: svgWidth, height: compact ? 190 : 300, budget: BUDGET, isRunning, animate: true }),
+        tokenChartSvg(requests, steps, { width: svgWidth, height: compact ? 210 : 300, budget: BUDGET, isRunning, animate: false }),
         `Context per request: ${requests.length} requests, peak ${formatTokens(stats.peak)} of ${formatTokens(BUDGET)}, now ${formatTokens(stats.current)}`,
       )
     return (
@@ -478,35 +557,33 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
 
   const overview = (): JSX.Element => (
     <Box flexDirection="column">
-      {heading('Outcome', tone, reported)}
-      {glance()}
-      {hasTokens && heading('Context', PALETTE.output, `${requests.length} ${requests.length === 1 ? 'request' : 'requests'}`)}
-      {contextBars(true)}
-      {steps.length > 0 && !isTerminal && heading('Timeline', PALETTE.now, toolsOf(run))}
-      {timeline()}
-      {heading('What it did', PALETTE.explore, `${toolsOf(run)}${failedCalls > 0 ? ` · ${failedCalls} failed` : ''}${isRunning && run.lastTool !== null ? ` · last ${run.lastTool}` : ''}`)}
-      {steps.length === 0 ? (
-        noSteps
-      ) : (
-        <Box flexDirection="column">
-          {earlier > 0 && (
-            <Box marginTop={1}>
-              <Text dimColor>{`⋯ ${earlier} earlier ${earlier === 1 ? 'phase' : 'phases'}`}</Text>
-            </Box>
-          )}
-          {phases.slice(earlier).map((phase, i) => phaseView(phase, earlier + i))}
-          {label('Tool mix')}
-          {toolMix}
-          {edited.length > 0 && label('Files edited', PALETTE.edit)}
-          {edited.map(path => (
-            <Text key={`orchestrator-edited-${path}`} mono>{`✎ ${clip(path, width - 2)}`}</Text>
-          ))}
-          {readFiles.length > 0 && label('Files read', PALETTE.explore)}
-          {readFiles.length > 0 && (
-            <Text dimColor>{clip(readFiles.slice(0, 6).join(', ') + (readFiles.length > 6 ? ` +${readFiles.length - 6} more` : ''), width * 2)}</Text>
-          )}
-        </Box>
-      )}
+      {section('orchestrator-section-outcome', 'Outcome', tone, reported, [glance()])}
+      {hasTokens && section('orchestrator-section-context', 'Context', PALETTE.output, `${requests.length} ${requests.length === 1 ? 'request' : 'requests'}`, [contextBars(true)])}
+      {steps.length > 0 && !isTerminal && section('orchestrator-section-timeline', 'Timeline', PALETTE.now, toolsOf(run), [timeline()])}
+      {section('orchestrator-section-did', 'What it did', PALETTE.explore, `${toolsOf(run)}${failedCalls > 0 ? ` · ${failedCalls} failed` : ''}${isRunning && run.lastTool !== null ? ` · last ${run.lastTool}` : ''}`, [
+        steps.length === 0 ? (
+          noSteps
+        ) : (
+          <Box key="orchestrator-did" flexDirection="column">
+            {earlier > 0 && (
+              <Box marginTop={1}>
+                <Text dimColor>{`⋯ ${earlier} earlier ${earlier === 1 ? 'phase' : 'phases'}`}</Text>
+              </Box>
+            )}
+            {phases.slice(earlier).map((phase, i) => phaseView(phase, earlier + i))}
+            {label('Tool mix')}
+            {toolMix}
+            {edited.length > 0 && label('Files edited', PALETTE.edit)}
+            {edited.map(path => (
+              <Text key={`orchestrator-edited-${path}`} mono>{`✎ ${clip(path, width - 2)}`}</Text>
+            ))}
+            {readFiles.length > 0 && label('Files read', PALETTE.explore)}
+            {readFiles.length > 0 && (
+              <Text dimColor>{clip(readFiles.slice(0, 6).join(', ') + (readFiles.length > 6 ? ` +${readFiles.length - 6} more` : ''), width * 2)}</Text>
+            )}
+          </Box>
+        ),
+      ])}
     </Box>
   )
 
@@ -518,14 +595,20 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
     const chars = kept.brief.length
     return (
       <Box flexDirection="column">
-        {heading('Brief', PALETTE.other, sections.length > 1 ? `${sections.length} sections` : undefined)}
-        <Box flexDirection="column" gap={1} marginTop={1}>
-          {sections.map((s, i) => (
-            <Box key={`orchestrator-brief-${i}`} flexDirection="column" borderStyle="round" borderColor={SECTION_COLORS[s.id]} paddingX={1}>
-              <Text bold color={SECTION_COLORS[s.id]}>{`${s.icon} ${s.title}`}</Text>
-              {s.body !== '' ? <Markdown key={`orchestrator-brief-text-${i}`} text={hardBreaks(s.body)} /> : note('(empty)')}
-            </Box>
-          ))}
+        {isTerminal && heading('Brief', PALETTE.other, sections.length > 1 ? `${sections.length} sections` : undefined)}
+        <Box flexDirection="column" gap={isTerminal ? 1 : undefined} marginTop={isTerminal ? 1 : undefined}>
+          {sections.map((s, i) =>
+            isTerminal ? (
+              <Box key={`orchestrator-brief-${i}`} flexDirection="column" borderStyle="round" borderColor={SECTION_COLORS[s.id]} paddingX={1}>
+                <Text bold color={SECTION_COLORS[s.id]}>{`${s.icon} ${s.title}`}</Text>
+                {s.body !== '' ? <Markdown key={`orchestrator-brief-text-${i}`} text={hardBreaks(s.body)} /> : note('(empty)')}
+              </Box>
+            ) : (
+              section(`orchestrator-brief-${i}`, `${s.icon} ${s.title}`, SECTION_COLORS[s.id], undefined, [
+                s.body !== '' ? <Markdown key={`orchestrator-brief-text-${i}`} text={hardBreaks(s.body)} /> : note('(empty)'),
+              ])
+            ),
+          )}
           {sections.length === 0 && note('The brief is empty.')}
         </Box>
         <Box marginTop={1}>
@@ -538,7 +621,7 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
   // ---- Steps: every call, each one opened to its input and output
 
   const stepsTab = (): JSX.Element => {
-    if (steps.length === 0) return <Box flexDirection="column">{heading('Steps', PALETTE.explore)}{noSteps}</Box>
+    if (steps.length === 0) return section('orchestrator-section-steps', 'Steps', PALETTE.explore, undefined, [noSteps])
     const folded = !isAll && steps.length > STEP_ROWS
     const shown = folded ? steps.slice(-STEP_ROWS) : steps
     const dropped = (latest?.n ?? 0) - steps.length
@@ -547,7 +630,7 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
     const detail = (step: AgentStep) => {
       const color = kindColor(step.tool)
       return (
-        <Box key={`orchestrator-step-detail-${step.n}`} flexDirection="column" borderStyle="round" borderColor={color} paddingX={1} marginBottom={1}>
+        <Box key={`orchestrator-step-detail-${step.n}`} flexDirection="column" borderStyle="round" borderColor={isTerminal ? color : undefined} borderDimColor={!isTerminal} paddingX={1} marginBottom={1}>
           <Box flexWrap="wrap" columnGap={1}>
             <Text bold color={color}>{`#${step.n} ${step.tool}`}</Text>
             {step.ms !== null ? <Text dimColor>{`took ${took(step.ms)}`}</Text> : <Text color={PALETTE.run}>● running</Text>}
@@ -555,12 +638,10 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
             {step.isError && chip('failed', PALETTE.error)}
           </Box>
           {label('Input', PALETTE.explore)}
-          {step.input !== undefined && step.input !== '' ? <Code language="json" source={step.input} /> : note('Input not kept')}
+          {step.input !== undefined && step.input !== '' ? longText(`orchestrator-step-input-${step.n}`, step.input) : note('Input not kept')}
           {label('Output', step.isError ? PALETTE.error : PALETTE.output)}
           {step.output !== undefined && step.output !== '' ? (
-            <Box borderStyle={step.isError ? 'round' : undefined} borderColor={step.isError ? PALETTE.error : undefined}>
-              <Code source={step.output} />
-            </Box>
+            longText(`orchestrator-step-output-${step.n}`, step.output, step.isError)
           ) : (
             note(step.ms === null ? 'Still running…' : 'Output not kept')
           )}
@@ -594,19 +675,20 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
     }
     return (
       <Box flexDirection="column">
-        {heading('Steps', PALETTE.explore, `${toolsOf(run)}${failedCalls > 0 ? ` · ${failedCalls} failed` : ''} · press a call to open its input and output`)}
-        {!isTerminal && <Box marginTop={1}>{timeline()}</Box>}
-        {folded && (
-          <Box marginTop={1}>
-            <Text dimColor>{`⋯ ${steps.length - STEP_ROWS} earlier calls`}</Text>
-          </Box>
-        )}
-        {isAll && dropped > 0 && <Text dimColor>{`The first ${dropped} calls were not kept.`}</Text>}
-        <Box flexDirection="column" marginTop={1}>
-          {shown.map(row)}
-        </Box>
-        {steps.length > STEP_ROWS &&
-          button('orchestrator-steps-toggle', isAll ? `▴ Show the latest ${STEP_ROWS}` : `▾ Show all ${steps.length} calls`, () => update($, showAllSteps, (open: boolean) => !open))}
+        {!isTerminal && section('orchestrator-section-timeline', 'Timeline', PALETTE.now, toolsOf(run), [timeline()])}
+        {section('orchestrator-section-steps', 'Steps', PALETTE.explore, `${toolsOf(run)}${failedCalls > 0 ? ` · ${failedCalls} failed` : ''} · press a call to open its input and output`, [
+          folded && (
+            <Box key="orchestrator-steps-folded" marginTop={1}>
+              <Text dimColor>{`⋯ ${steps.length - STEP_ROWS} earlier calls`}</Text>
+            </Box>
+          ),
+          isAll && dropped > 0 && <Text key="orchestrator-steps-dropped" dimColor>{`The first ${dropped} calls were not kept.`}</Text>,
+          <Box key="orchestrator-steps-rows" flexDirection="column" marginTop={isTerminal ? 1 : undefined}>
+            {shown.map(row)}
+          </Box>,
+          steps.length > STEP_ROWS &&
+            button('orchestrator-steps-toggle', isAll ? `▴ Show the latest ${STEP_ROWS}` : `▾ Show all ${steps.length} calls`, () => update($, showAllSteps, (open: boolean) => !open)),
+        ])}
       </Box>
     )
   }
@@ -615,16 +697,13 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
 
   const tokensTab = (): JSX.Element => {
     if (!hasTokens)
-      return (
-        <Box flexDirection="column">
-          {heading('Tokens', PALETTE.output)}
-          {note(kept?.requests === undefined ? 'No requests recorded: this agent started before the mod kept token usage.' : 'No requests recorded yet.')}
-        </Box>
-      )
+      return section('orchestrator-section-tokens', 'Tokens', PALETTE.output, undefined, [
+        note(kept?.requests === undefined ? 'No requests recorded: this agent started before the mod kept token usage.' : 'No requests recorded yet.'),
+      ])
     const currentFrac = stats.current / BUDGET
     const rows: Stat[] = [
-      { value: formatTokens(stats.peak), what: `peak context · ${percent(peakFrac)} of ${formatTokens(BUDGET)}`, color: levelColor(peakFrac) },
-      { value: formatTokens(stats.current), what: `now · ${percent(currentFrac)} of ${formatTokens(BUDGET)}`, color: levelColor(currentFrac) },
+      { value: formatTokens(stats.peak), what: `peak context · ${percent(peakFrac)} of ${formatTokens(BUDGET)}`, color: levelColor(peakFrac), alert: peakFrac >= 0.75 },
+      { value: formatTokens(stats.current), what: `now · ${percent(currentFrac)} of ${formatTokens(BUDGET)}`, color: levelColor(currentFrac), alert: currentFrac >= 0.75 },
       { value: String(stats.count), what: stats.count === 1 ? 'request' : 'requests', color: PALETTE.explore },
       { value: formatTokens(stats.totalOutput), what: 'output tokens', color: PALETTE.output },
       { value: formatTokens(stats.totalPrompt), what: 'prompt tokens processed', color: PALETTE.research },
@@ -637,50 +716,44 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
         : `after ${calls.slice(0, 2).map(c => `${c.tool}${c.target !== '' ? ` ${c.target}` : ''}`).join(', ')}${calls.length > 2 ? ` +${calls.length - 2} more` : ''}`
     return (
       <Box flexDirection="column">
-        {heading('Tokens', PALETTE.output, `${stats.count} ${stats.count === 1 ? 'request' : 'requests'}`)}
-        <Box marginTop={1} flexDirection="column">
-          {contextBars(false)}
-        </Box>
-        {isTerminal ? (
-          <Box flexDirection="column" marginTop={1}>
-            {rows.map(r => (
-              <Box key={`orchestrator-number-${r.what}`}>
-                <Text bold tabular color={r.color}>
-                  {r.value.padStart(7)}
-                </Text>
-                <Text dimColor>{`  ${r.what}`}</Text>
+        {section('orchestrator-section-tokens', 'Tokens', PALETTE.output, `${stats.count} ${stats.count === 1 ? 'request' : 'requests'}`, [
+          <Box key="orchestrator-tokens-chart" flexDirection="column" marginTop={isTerminal ? 1 : undefined}>
+            {contextBars(false)}
+          </Box>,
+          isTerminal ? (
+            <Box key="orchestrator-tokens-numbers" flexDirection="column" marginTop={1}>
+              {rows.map(r => (
+                <Box key={`orchestrator-number-${r.what}`}>
+                  <Text bold tabular color={r.color}>
+                    {r.value.padStart(7)}
+                  </Text>
+                  <Text dimColor>{`  ${r.what}`}</Text>
+                </Box>
+              ))}
+            </Box>
+          ) : (
+            <Box key="orchestrator-tokens-numbers" flexDirection="column">
+              {tileGrid(rows)}
+            </Box>
+          ),
+        ])}
+        {stats.jumps.length > 0 &&
+          section('orchestrator-section-jumps', 'Biggest jumps', PALETTE.warn, 'where the context grew most', [
+            ...stats.jumps.map(j => (
+              <Box key={`orchestrator-jump-${j.request}`} columnGap={1} flexWrap="wrap">
+                <Text bold color={levelColor(j.prompt / BUDGET)} tabular>{`+${formatTokens(j.delta)}`}</Text>
+                <Text dimColor>{`request #${j.request} → ${formatTokens(j.prompt)}`}</Text>
+                <Text color={j.calls[0] !== undefined ? kindColor(j.calls[0].tool) : undefined}>{clip(callsOf(j.calls), Math.max(20, width - 32))}</Text>
               </Box>
-            ))}
-          </Box>
-        ) : (
-          <Box marginTop={1} flexWrap="wrap" gap={1}>
-            {rows.map(r => (
-              <Box key={`orchestrator-number-${r.what}`} flexDirection="column" borderStyle="round" borderColor={r.color} paddingX={1}>
-                <Text size="title" bold tabular>
-                  {r.value}
-                </Text>
-                <Text size="caption" dimColor>
-                  {r.what}
+            )),
+            stats.over.length > 0 && (
+              <Box key="orchestrator-over" marginTop={1}>
+                <Text color={PALETTE.bad} bold>
+                  {`Over the ${formatTokens(BUDGET)} budget: ${stats.over.length === 1 ? 'request' : 'requests'} ${stats.over.slice(0, 6).map(n => `#${n}`).join(', ')}${stats.over.length > 6 ? ` +${stats.over.length - 6} more` : ''}`}
                 </Text>
               </Box>
-            ))}
-          </Box>
-        )}
-        {stats.jumps.length > 0 && heading('Biggest jumps', PALETTE.warn, 'where the context grew most')}
-        {stats.jumps.map(j => (
-          <Box key={`orchestrator-jump-${j.request}`} columnGap={1} flexWrap="wrap">
-            <Text bold color={levelColor(j.prompt / BUDGET)} tabular>{`+${formatTokens(j.delta)}`}</Text>
-            <Text dimColor>{`request #${j.request} → ${formatTokens(j.prompt)}`}</Text>
-            <Text color={j.calls[0] !== undefined ? kindColor(j.calls[0].tool) : undefined}>{clip(callsOf(j.calls), Math.max(20, width - 32))}</Text>
-          </Box>
-        ))}
-        {stats.over.length > 0 && (
-          <Box marginTop={1}>
-            <Text color={PALETTE.bad} bold>
-              {`Over the ${formatTokens(BUDGET)} budget: ${stats.over.length === 1 ? 'request' : 'requests'} ${stats.over.slice(0, 6).map(n => `#${n}`).join(', ')}${stats.over.length > 6 ? ` +${stats.over.length - 6} more` : ''}`}
-            </Text>
-          </Box>
-        )}
+            ),
+          ])}
       </Box>
     )
   }
@@ -688,7 +761,7 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
   // ---- Report: the fields, then the report as written
 
   const reportTab = (): JSX.Element => {
-    if (report === null) return <Box flexDirection="column">{heading('Report', tone)}{noReport}</Box>
+    if (report === null) return section('orchestrator-section-report', 'Report', tone, undefined, [noReport])
     const evidence =
       parsed?.evidence !== undefined ? (
         <Box key="orchestrator-evidence-block" flexDirection="column">
@@ -704,30 +777,30 @@ export async function renderPane($: EngineInterface, e: RenderInput<'Pane'>) {
         </Box>
       ) : null
     const openFirst = parsed?.status === 'partial' || parsed?.status === 'blocked'
-    return (
-      <Box flexDirection="column">
-        {heading('Report', tone, reported)}
-        {parsed === null ? (
-          answerBox('Report', <Markdown key="orchestrator-report" text={hardBreaks(report)} />)
-        ) : (
-          <Box flexDirection="column">
-            {answerView}
-            {parsed.changes !== undefined && label('✎ Changes', PALETTE.edit)}
-            {parsed.changes !== undefined && <Markdown key="orchestrator-changes-all" text={hardBreaks(listify(parsed.changes))} />}
-            {openFirst ? open : evidence}
-            {openFirst ? evidence : open}
-            {parsed.notes !== '' && label('Notes')}
-            {parsed.notes !== '' && <Markdown key="orchestrator-notes" dimColor text={hardBreaks(parsed.notes)} />}
-          </Box>
-        )}
-        {parsed !== null && button('orchestrator-report-raw', isRaw ? '▴ Hide the raw report' : `▾ Show the raw report (${report.length.toLocaleString('en-US')} characters)`, () => update($, showRawReport, (open: boolean) => !open))}
-        {parsed !== null && isRaw && (
-          <Box marginTop={1}>
-            <Code source={report} />
-          </Box>
-        )}
-      </Box>
-    )
+    return section('orchestrator-section-report', 'Report', tone, reported, [
+      parsed === null ? (
+        answerBox('Report', <Markdown key="orchestrator-report" text={hardBreaks(report)} />)
+      ) : (
+        <Box key="orchestrator-report-fields" flexDirection="column">
+          {answerView}
+          {parsed.changes !== undefined && label('✎ Changes', PALETTE.edit)}
+          {parsed.changes !== undefined && <Markdown key="orchestrator-changes-all" text={hardBreaks(listify(parsed.changes))} />}
+          {openFirst ? open : evidence}
+          {openFirst ? evidence : open}
+          {parsed.notes !== '' && label('Notes')}
+          {parsed.notes !== '' && <Markdown key="orchestrator-notes" dimColor text={hardBreaks(parsed.notes)} />}
+        </Box>
+      ),
+      parsed !== null &&
+        button('orchestrator-report-raw', isRaw ? '▴ Hide the raw report' : `▾ Show the raw report (${report.length.toLocaleString('en-US')} characters)`, () => update($, showRawReport, (open: boolean) => !open)),
+      // Wrapped in the pane, not a Code block: one that scrolls inside itself kept the wheel
+      // once it filled the view, and the pane could not be scrolled back up.
+      parsed !== null && isRaw && (
+        <Box key="orchestrator-report-raw-text" marginTop={1}>
+          {longText('orchestrator-report-raw-body', report)}
+        </Box>
+      ),
+    ])
   }
 
   const body = active === 'brief' ? briefTab() : active === 'steps' ? stepsTab() : active === 'tokens' ? tokensTab() : active === 'report' ? reportTab() : overview()
